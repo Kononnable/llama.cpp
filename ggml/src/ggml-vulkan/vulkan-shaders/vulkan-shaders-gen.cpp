@@ -317,28 +317,21 @@ using compile_count_guard = std::unique_ptr<uint32_t, decltype(&decrement_compil
 compile_count_guard acquire_compile_slot() {
     // wait until fewer than N compiles are in progress.
     // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
-        std::cerr << [&]{
-    std::ifstream m("/proc/meminfo");
-    std::string l;
-    auto kb = [&](const char* k){
-        std::ifstream f("/proc/meminfo");
-        std::string s;
-        while (std::getline(f,s))
-            if (s.rfind(k,0)==0) { size_t c=s.find(':'); return std::stol(s.substr(c+1))/1024; }
-        return -1L;
-    };
-    long a=kb("MemAvailable"),t=kb("MemTotal"),f=kb("MemFree"),st=kb("SwapTotal"),sf=kb("SwapFree");
-    long rss=0,hwm=0,sz=0;
-    std::ifstream s("/proc/self/status");
-    while (std::getline(s,l)){
-        if (l.rfind("VmRSS:",0)==0) rss=std::stol(l.substr(6));
-        else if (l.rfind("VmHWM:",0)==0) hwm=std::stol(l.substr(6));
-        else if (l.rfind("VmSize:",0)==0) sz=std::stol(l.substr(7));
-    }
-    std::ostringstream o;
-    o << "[mem] avail="<<a<<"MB total="<<t<<"MB free="<<f<<"MB swap="<<sf<<"/"<<st<<"MB self(rss="<<rss<<" hwm="<<hwm<<" sz="<<sz<<")MB\n";
-    return o.str();
-}();
+    std::cerr << [&]{
+    auto _trim=[](std::string s){ while(!s.empty()&&std::isspace((unsigned char)s.back())) s.pop_back(); size_t i=0; while(i<s.size()&&std::isspace((unsigned char)s[i])) ++i; return s.substr(i); };
+    auto _read=[&](const char* p){ std::ifstream f(p); if(!f) return std::string{}; std::ostringstream o; o<<f.rdbuf(); return o.str(); };
+    auto _exists=[](const char* p){ std::ifstream f(p); return (bool)f; };
+    auto _kb=[&](const char* k){ std::ifstream f("/proc/meminfo"); std::string s; while(std::getline(f,s)) if(s.rfind(k,0)==0){ size_t c=s.find(':'); return std::stol(s.substr(c+1))/1024; } return -1L; };
+    long long _cur=-1,_max=-1,_pc=-1,_pm=-1,_oom=0;
+    if (_exists("/sys/fs/cgroup/memory.max")) { std::string m=_trim(_read("/sys/fs/cgroup/memory.max")); if(m!="max") _max=std::stoll(m)/(1024*1024); std::string c=_trim(_read("/sys/fs/cgroup/memory.current")); if(!c.empty()) _cur=std::stoll(c)/(1024*1024); }
+    else if (_exists("/sys/fs/cgroup/memory/memory.limit_in_bytes")) { std::string m=_trim(_read("/sys/fs/cgroup/memory/memory.limit_in_bytes")); if(m!="max") _max=std::stoll(m)/(1024*1024); std::string c=_trim(_read("/sys/fs/cgroup/memory/memory.usage_in_bytes")); if(!c.empty()) _cur=std::stoll(c)/(1024*1024); }
+    if (_exists("/sys/fs/cgroup/pids.max")) { std::string m=_trim(_read("/sys/fs/cgroup/pids.max")); if(m!="max") _pm=std::stoll(m); std::string c=_trim(_read("/sys/fs/cgroup/pids.current")); if(!c.empty()) _pc=std::stoll(c); }
+    else if (_exists("/sys/fs/cgroup/pids/pids.max")) { std::string m=_trim(_read("/sys/fs/cgroup/pids/pids.max")); if(m!="max") _pm=std::stoll(m); std::string c=_trim(_read("/sys/fs/cgroup/pids/pids.current")); if(!c.empty()) _pc=std::stoll(c); }
+    { std::string ev=_read("/sys/fs/cgroup/memory.events"); size_t p=ev.find("oom "); if(p!=std::string::npos){ size_t s=ev.find_first_not_of(" \t",p+4), e=ev.find('\n',s); _oom=std::stoll(ev.substr(s,e-s)); } }
+    long _av=_kb("MemAvailable"),_tot=_kb("MemTotal"),_fre=_kb("MemFree"),_cl=_kb("CommitLimit"),_ca=_kb("Committed_AS");
+    long _rss=0,_hwm=0,_sz=0; std::ifstream _s("/proc/self/status"); std::string _l; while(std::getline(_s,_l)){ if(_l.rfind("VmRSS:",0)==0) _rss=std::stol(_l.substr(6))/1024; else if(_l.rfind("VmHWM:",0)==0) _hwm=std::stol(_l.substr(6))/1024; else if(_l.rfind("VmSize:",0)==0) _sz=std::stol(_l.substr(7))/1024; }
+    std::ostringstream _o; _o<<"[mem]"; if(_cur>=0||_max>=0) _o<<" cgroup(mem="<<_cur<<"/"<<_max<<"MB)"; if(_pc>=0||_pm>=0) _o<<" cgroup(pids="<<_pc<<"/"<<_pm<<")"; if(_oom>0) _o<<" oomKills="<<_oom; _o<<" sys(avail="<<_av<<" total="<<_tot<<" free="<<_fre<<"MB) commit("<<_ca<<"/"<<_cl<<"MB) self(rss="<<_rss<<" hwm="<<_hwm<<" sz="<<_sz<<"MB)\n"; return _o.str();
+}();        
     uint32_t N = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     std::unique_lock<std::mutex> guard(compile_count_mutex);
     compile_count_cond.wait(guard, [N] { return compile_count < N; });
