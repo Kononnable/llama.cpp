@@ -133,6 +133,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          
+          sudo sysctl -w vm.overcommit_memory=1
+          sudo sysctl -w vm.overcommit_ratio=200
 
           REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
           REPO_NAME="${{ github.event.repository.name }}"
