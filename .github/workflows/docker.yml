@@ -138,6 +138,11 @@ jobs:
           cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "n/a"
           echo "--- cgroup memory.max ---"
           cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "n/a"
+          echo "--- overcommit settings ---"
+          cat /proc/sys/vm/overcommit_memory
+          cat /proc/sys/vm/overcommit_ratio
+          echo "--- commit accounting ---"
+          grep -E '^(CommitLimit|Committed_AS):' /proc/meminfo
       - name: Set up QEMU
         if: ${{ contains(matrix.config.platforms, 'linux/amd64') }}
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
