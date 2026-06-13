@@ -317,7 +317,29 @@ using compile_count_guard = std::unique_ptr<uint32_t, decltype(&decrement_compil
 compile_count_guard acquire_compile_slot() {
     // wait until fewer than N compiles are in progress.
     // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
-    uint32_t N = 1u;
+        std::cerr << [&]{
+    std::ifstream m("/proc/meminfo");
+    std::string l;
+    auto kb = [&](const char* k){
+        std::ifstream f("/proc/meminfo");
+        std::string s;
+        while (std::getline(f,s))
+            if (s.rfind(k,0)==0) { size_t c=s.find(':'); return std::stol(s.substr(c+1))/1024; }
+        return -1L;
+    };
+    long a=kb("MemAvailable"),t=kb("MemTotal"),f=kb("MemFree"),st=kb("SwapTotal"),sf=kb("SwapFree");
+    long rss=0,hwm=0,sz=0;
+    std::ifstream s("/proc/self/status");
+    while (std::getline(s,l)){
+        if (l.rfind("VmRSS:",0)==0) rss=std::stol(l.substr(6));
+        else if (l.rfind("VmHWM:",0)==0) hwm=std::stol(l.substr(6));
+        else if (l.rfind("VmSize:",0)==0) sz=std::stol(l.substr(7));
+    }
+    std::ostringstream o;
+    o << "[mem] avail="<<a<<"MB total="<<t<<"MB free="<<f<<"MB swap="<<sf<<"/"<<st<<"MB self(rss="<<rss<<" hwm="<<hwm<<" sz="<<sz<<")MB\n";
+    return o.str();
+}();
+    uint32_t N = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     std::unique_lock<std::mutex> guard(compile_count_mutex);
     compile_count_cond.wait(guard, [N] { return compile_count < N; });
     compile_count++;
