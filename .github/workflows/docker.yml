@@ -107,6 +107,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: 337528571d99e414ca04fddd86d448960137770f
       - name: Determine source tag name
         id: srctag
         uses: ./.github/actions/get-tag-name
