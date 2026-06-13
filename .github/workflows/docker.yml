@@ -114,13 +114,30 @@ jobs:
           BRANCH_NAME: ${{ github.head_ref || github.ref_name }}      
       - name: Create swap
         run: |
+          # Create swap file on host
           sudo swapoff /swapfile 2>/dev/null || true
           sudo rm -f /swapfile
           sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
+
+          if [ -f /sys/fs/cgroup/memory.swap.max ]; then
+            sudo tee /sys/fs/cgroup/memory.swap.max <<< "8589934592" >/dev/null
+          elif [ -f /sys/fs/cgroup/memory/memory.swappiness ]; then
+            sudo tee /sys/fs/cgroup/memory/memory.swappiness <<< "100" >/dev/null
+          fi
+
+          echo "--- free -h ---"
           free -h
+          echo "--- swapon ---"
+          swapon --show
+          echo "--- cgroup swap.max ---"
+          cat /sys/fs/cgroup/memory.swap.max 2>/dev/null || echo "n/a"
+          echo "--- cgroup memory.current ---"
+          cat /sys/fs/cgroup/memory.current 2>/dev/null || echo "n/a"
+          echo "--- cgroup memory.max ---"
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "n/a"
       - name: Set up QEMU
         if: ${{ contains(matrix.config.platforms, 'linux/amd64') }}
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
