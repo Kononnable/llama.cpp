@@ -317,6 +317,7 @@ using compile_count_guard = std::unique_ptr<uint32_t, decltype(&decrement_compil
 compile_count_guard acquire_compile_slot() {
     // wait until fewer than N compiles are in progress.
     // 16 is an arbitrary limit, the goal is to avoid "failed to create pipe" errors.
+    std::cerr << " hw_concurrency=" << std::thread::hardware_concurrency();
     uint32_t N = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     std::unique_lock<std::mutex> guard(compile_count_mutex);
     compile_count_cond.wait(guard, [N] { return compile_count < N; });
