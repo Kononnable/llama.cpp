@@ -104,17 +104,16 @@ jobs:
       matrix:
         config: ${{ fromJSON(needs.prepare_matrices.outputs.build_matrix) }}
     steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Determine source tag name
         id: srctag
         uses: ./.github/actions/get-tag-name
         env:
           BRANCH_NAME: ${{ github.head_ref || github.ref_name }}      
-      - name: Check out the repo
-        id: checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          ref: ${{ steps.srctag.outputs.name }}
 
       - name: Set up QEMU
         if: ${{ contains(matrix.config.platforms, 'linux/amd64') }}
