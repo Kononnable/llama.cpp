@@ -112,7 +112,13 @@ jobs:
         uses: ./.github/actions/get-tag-name
         env:
           BRANCH_NAME: ${{ github.head_ref || github.ref_name }}      
-
+      - name: Create swap
+        run: |
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
       - name: Set up QEMU
         if: ${{ contains(matrix.config.platforms, 'linux/amd64') }}
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
@@ -218,5 +224,12 @@ jobs:
           #cache-to: type=local,dest=/tmp/.buildx-cache
           #cache-from: type=local,src=/tmp/.buildx-cache
           # using registry cache (no storage limit)
+      - name: Remove swap
+        if: always()
+        run: |
+          if [ -f /swapfile ]; then
+            sudo swapoff /swapfile 2>/dev/null || true
+            sudo rm -f /swapfile
+          fi
 
       
