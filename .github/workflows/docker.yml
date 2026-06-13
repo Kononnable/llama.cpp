@@ -114,7 +114,9 @@ jobs:
           BRANCH_NAME: ${{ github.head_ref || github.ref_name }}      
       - name: Create swap
         run: |
-          sudo fallocate -l 4G /swapfile
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=1096 status=none
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
