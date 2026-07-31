@@ -219,9 +219,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 switch (ggml_backend_dev_type(dev)) {
                     case GGML_BACKEND_DEVICE_TYPE_CPU:
                     case GGML_BACKEND_DEVICE_TYPE_ACCEL:
-                        // skip CPU backends since they are handled separately
-                        break;
-
+                        // skip CPU backends since they are handled separately - except RPC
+                        // servers, which honestly report their remote CPU device type but
+                        // must stay eligible for the GPU-facing paths
+                        if (ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) != std::string("RPC")) {
+                            break;
+                        }
+                        [[fallthrough]];
                     case GGML_BACKEND_DEVICE_TYPE_GPU: {
                         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
                         if (ggml_backend_reg_name(reg) == std::string("RPC")) {

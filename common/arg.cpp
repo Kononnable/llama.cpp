@@ -1067,7 +1067,11 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         ggml_backend_load_all();
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
-            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            // RPC servers may honestly report a remote CPU-backed device; they are still
+            // valid offload targets (and the "sm tensor" pools), so keep them here.
+            if (!dev ||
+                (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+                 ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) != std::string("RPC"))) {
                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
             }
             devices.push_back(dev);
@@ -1085,7 +1089,9 @@ void common_print_available_devices() {
 
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         auto * dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        // similarly, don't hide CPU-backed RPC servers - they are valid offload targets
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+            ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)) == std::string("RPC")) {
             devices.push_back(dev);
         }
     }

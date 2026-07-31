@@ -226,6 +226,8 @@ struct rpc_msg_get_dev_props_rsp {
     uint8_t host_buffer;
     uint8_t buffer_from_host_ptr;
     uint8_t events;
+    uint8_t dev_type;   // ggml_backend_dev_type of the remote device (proto >= 4.3)
+    char    _pad[3];    // keep the response 8-byte aligned
 };
 
 #pragma pack(pop)
@@ -244,9 +246,11 @@ struct ggml_backend_rpc_device_context {
     std::string description;
     uint64_t    last_graph_uid;
 
-    // lazily-queried remote device capabilities (proto >= 4.2), cached to avoid a query per op
-    std::optional<ggml_backend_dev_caps> caps;
-    std::unordered_map<uint64_t, bool>   supports_op_cache;
+    // lazily-queried remote device info (proto >= 4.2), cached to avoid a query per op
+    std::optional<struct ggml_backend_dev_caps>   caps;
+    std::unordered_map<uint64_t, bool>     supports_op_cache;
+    enum ggml_backend_dev_type             dev_type   = GGML_BACKEND_DEVICE_TYPE_GPU; // remote type (proto >= 4.3), defaults to GPU like pre-4.3 servers
+    std::string                            typed_desc;                                // description with "(type)" suffix, filled once caps are fetched
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -415,6 +419,23 @@ static bool rpc_server_supports_dev_props(const std::string & endpoint) {
     std::lock_guard<std::mutex> lock(rpc_conn_mutex());
     auto it = rpc_conn_map().find(endpoint);
     return it != rpc_conn_map().end() && it->second.server_minor >= 2;
+}
+
+static bool rpc_server_supports_dev_type(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(rpc_conn_mutex());
+    auto it = rpc_conn_map().find(endpoint);
+    return it != rpc_conn_map().end() && it->second.server_minor >= 3;
+}
+
+static const char * ggml_backend_dev_type_str(enum ggml_backend_dev_type type) {
+    switch (type) {
+        case GGML_BACKEND_DEVICE_TYPE_CPU:   return "CPU";
+        case GGML_BACKEND_DEVICE_TYPE_GPU:   return "GPU";
+        case GGML_BACKEND_DEVICE_TYPE_ACCEL: return "ACCEL";
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:  return "IGPU";
+        case GGML_BACKEND_DEVICE_TYPE_META:  return "Meta";
+        default:                             return "?";
+    }
 }
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
@@ -1647,6 +1668,7 @@ bool rpc_server::get_dev_props(const rpc_msg_get_dev_props_req & request, rpc_ms
     response.host_buffer          = props.caps.host_buffer;
     response.buffer_from_host_ptr = props.caps.buffer_from_host_ptr;
     response.events               = props.caps.events;
+    response.dev_type             = (uint8_t) props.type;
     return true;
 }
 
@@ -2040,7 +2062,12 @@ static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
 static const char * ggml_backend_rpc_device_get_description(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
 
-    return ctx->description.c_str();
+    // lazily fetch remote props (also fills dev_type + typed_desc); fall back to the
+    // plain endpoint for old servers
+    if (ctx->typed_desc.empty()) {
+        return ctx->description.c_str();
+    }
+    return ctx->typed_desc.c_str();
 }
 
 static void ggml_backend_rpc_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
@@ -2049,19 +2076,34 @@ static void ggml_backend_rpc_device_get_memory(ggml_backend_dev_t dev, size_t * 
     ggml_backend_rpc_get_device_memory(ctx->endpoint.c_str(), ctx->device, free, total);
 }
 
-static enum ggml_backend_dev_type ggml_backend_rpc_device_get_type(ggml_backend_dev_t dev) {
-    // TODO: obtain value from the server
-    return GGML_BACKEND_DEVICE_TYPE_GPU;
+static struct ggml_backend_dev_caps ggml_backend_rpc_device_caps(ggml_backend_dev_t dev);
 
-    GGML_UNUSED(dev);
+// an "RPC device" is identified by the registry it was created from ("RPC[endpoint]").
+// CPU-backed RPC servers are still kept in the GPU-facing paths (--list-devices,
+// --device, tensor-split pools) because llama.cpp treats RPC servers explicitly.
+bool ggml_backend_rpc_dev_is_rpc(ggml_backend_dev_t dev) {
+    if (!dev || !dev->reg) return false;
+    const char * name = ggml_backend_reg_name(dev->reg);
+    return name && strncmp(name, "RPC[", 4) == 0;
 }
 
-static ggml_backend_dev_caps ggml_backend_rpc_device_caps(ggml_backend_dev_t dev) {
+static enum ggml_backend_dev_type ggml_backend_rpc_device_get_type(ggml_backend_dev_t dev) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+
+    // Remote type is only available once the caps round-trip has run; until then we
+    // report GPU, which matches what old (proto < 4.2/4.3) servers would do anyway.
+    if (!ctx->caps.has_value() && rpc_server_supports_dev_props(ctx->endpoint)) {
+        (void) ggml_backend_rpc_device_caps(dev);
+    }
+    return ctx->dev_type;
+}
+
+static struct ggml_backend_dev_caps ggml_backend_rpc_device_caps(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
     if (ctx->caps.has_value()) {
         return *ctx->caps;
     }
-    ggml_backend_dev_caps caps = {
+    struct ggml_backend_dev_caps caps = {
         /* .async                 = */ false,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
@@ -2080,6 +2122,11 @@ static ggml_backend_dev_caps ggml_backend_rpc_device_caps(ggml_backend_dev_t dev
                 caps.host_buffer          = response.host_buffer;
                 caps.buffer_from_host_ptr = response.buffer_from_host_ptr;
                 caps.events               = response.events;
+                // dev_type was added in proto 4.3
+                if (rpc_server_supports_dev_type(ctx->endpoint)) {
+                    ctx->dev_type = static_cast<enum ggml_backend_dev_type>(response.dev_type);
+                }
+                ctx->typed_desc = ctx->description + " (" + ggml_backend_dev_type_str(ctx->dev_type) + ")";
             }
         }
     }
@@ -2294,6 +2341,8 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
             /* .last_graph_uid   = */    0,
             /* .caps             = */    std::nullopt,
             /* .supports_op_cache = */   {},
+            /* .dev_type         = */    GGML_BACKEND_DEVICE_TYPE_GPU,
+            /* .typed_desc       = */    "",
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {
