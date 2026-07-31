@@ -2732,7 +2732,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
-        "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
+        "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1\n"
+        "-sm tensor additionally supports 'e' suffixed entries, e.g. 1,2,2e,3e: non-expert weights are split "
+        "across the plain (GPU) entries in proportion 1:2, expert weights across the 'e' (CPU) entries in "
+        "proportion 2:3. Mixing 'e' forms with -ncmoe/-cmoe/-ot expert overrides is an error.",
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 
@@ -2745,11 +2748,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
             }
+            bool has_expert_split     = false;
+            bool has_non_expert_split = false;
             for (size_t i = 0; i < llama_max_devices(); ++i) {
                 if (i < split_arg.size()) {
-                    params.tensor_split[i] = std::stof(split_arg[i]);
+                    std::string part = split_arg[i];
+                    // 'e' marks an expert-device entry alongside plain GPU proportions; we store them negated
+                    // (magnitude preserved) so llama can tell the two classes apart from the same array
+                    bool is_expert = false;
+                    if (!part.empty() && (part.back() == 'e' || part.back() == 'E')) {
+                        is_expert = true;
+                        part.pop_back();
+                    }
+                    float v = std::stof(part);
+                    if (v <= 0.0f) {
+                        throw std::invalid_argument(string_format("invalid tensor split value: '%s'", split_arg[i].c_str()));
+                    }
+                    params.tensor_split[i] = is_expert ? -v : v;
+                    has_expert_split     |= is_expert;
+                    has_non_expert_split |= !is_expert;
                 } else {
                     params.tensor_split[i] = 0.0f;
+                }
+            }
+            if (has_expert_split) {
+                if (!has_non_expert_split) {
+                    throw std::invalid_argument("tensor split with '-e' requires at least one non-expert (GPU) entry");
+                }
+                // the buffer-override based MoE offloading mixes concepts with the grouped split
+                if (!params.tensor_buft_overrides.empty() ||
+                    !params.speculative.draft.tensor_buft_overrides.empty()) {
+                    throw std::invalid_argument(
+                        "tensor split with '-e' cannot be combined with --cpu-moe/-cmoe, --n-cpu-moe/-ncmoe, "
+                        "or expert --override-tensor/-ot rules; use one mechanism or the other");
                 }
             }
             if (!llama_supports_gpu_offload()) {

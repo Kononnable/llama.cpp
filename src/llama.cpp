@@ -345,6 +345,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
+
+        // -ts entries with the 'e' (expert) marker request expert-only offloading; that only
+        // applies to MoE models
+        if (params.tensor_split != nullptr && model->hparams.n_expert <= 1) {
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                if (params.tensor_split[i] < 0.0f) {
+                    throw std::runtime_error(
+                        "tensor split with expert markers ('e') requires a MoE model");
+                }
+            }
+        }
         try {
             model->load_vocab(ml);
         } catch(const std::exception & e) {

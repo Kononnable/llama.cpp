@@ -92,6 +92,21 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
   - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
   - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
 
+#### Expert (MoE) tensor split with `-ts ...e`
+
+For MoE models you can mark entries in `--tensor-split` with the `e` suffix to send that device's
+share of the *expert* weights to it, while non-expert layers go only to the unmarked (GPU) devices:
+
+```bash
+llama-cli -m moe-model.gguf -sm tensor -ts 1,2,2e,3e
+```
+
+Here devices 0 and 1 (GPUs) split non-expert weights in a 1:2 ratio; devices 2 and 3 (CPUs,
+often remote via `--rpc`) split expert weights in a 2:3 ratio. Notes:
+
+- Requires a MoE model; using `e` with a dense model is an error.
+- Cannot be combined with `-cmoe`/`-ncmoe` or `-ot` expert overrides.
+
 ### 5. With NCCL
 
 There's no runtime flag for NCCL - it's selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log to see whether or not it can find the package. When llama.cpp is compiled with NCCL support it uses it automatically for cross-GPU reductions in `tensor` mode. When NCCL is missing on a multi-GPU build, you'll see this one-time warning and performance will be lower:

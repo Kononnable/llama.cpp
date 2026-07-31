@@ -680,10 +680,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
+
+        // tensor_split can hold "expert" entries marked negative (set by -ts ...,2e,3e):
+        // expert-weight tensors use only the magnitudes of the negative entries, everything
+        // else (attn/non-expert/KV/compute/etc.) gets only the plain positive fractions.
+        const bool tensor_is_expert = std::regex_search(tensor_name, std::regex("_exps"));
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            if (!tensor_split) {
+                tensor_split_scan.push_back(0.0f);
+            } else if (tensor_is_expert) {
+                const float v = tensor_split[(j + tc.rotation) % ud->n_devices];
+                tensor_split_scan.push_back(v < 0.0f ? -v : 0.0f);
+            } else {
+                const float v = tensor_split[(j + tc.rotation) % ud->n_devices];
+                tensor_split_scan.push_back(v > 0.0f ? v : 0.0f);
+            }
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
