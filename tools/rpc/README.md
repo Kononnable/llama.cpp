@@ -83,6 +83,8 @@ $ llama-cli -hf ggml-org/gemma-3-1b-it-GGUF -ngl 99 --rpc 192.168.88.10:50052,19
 By default, llama.cpp distributes model weights and the KV cache across all available devices -- both local and remote -- in proportion to each device's available memory.
 You can override this behavior with the `--tensor-split` option and set custom proportions when splitting tensor data across devices.
 
+To use tensor-split (`-sm tensor`) with RPC devices, the `ggml-rpc-server` binary on every remote host must be built from the same (or newer) sources as the client -- it requires RPC protocol >= 4.1. Older servers will fail with a clear error during model load (`buffer not registered` / `out of buffer bounds` in deserialize) instead of crashing in graph compute.
+
 ### Local cache
 
 The RPC server can use a local cache to store large tensors and avoid transferring them over the network.

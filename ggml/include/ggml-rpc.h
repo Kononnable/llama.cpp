@@ -7,8 +7,12 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    5
-#define RPC_PROTO_MINOR_VERSION    0
+#define RPC_PROTO_MINOR_VERSION    2
 #define RPC_PROTO_PATCH_VERSION    0
+
+// Minor-version protocol features (client gates on negotiated server minor):
+//   5.1  rpc_tensor data may carry a buffer-relative offset (RPC_TENSOR_FLAG2_DATA_IS_OFFSET)
+//   5.2  RPC_CMD_SUPPORTS_OP / RPC_CMD_GET_DEV_PROPS (honest remote capability reporting)
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
