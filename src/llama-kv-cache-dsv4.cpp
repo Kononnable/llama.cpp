@@ -1019,8 +1019,7 @@ uint32_t llama_dsv4_comp_state::get_n_rows() const {
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
-        ret[buft] += ggml_backend_buffer_get_size(buf.get());
+        llama_memory_breakdown_add(ret, buf.get());
     }
     return ret;
 }

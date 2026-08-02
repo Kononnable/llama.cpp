@@ -4,6 +4,8 @@
 
 #include "../src/llama-ext.h"
 
+#include "ggml-backend.h"
+
 #include <array>
 #include <cassert>
 #include <stdexcept>
@@ -87,7 +89,19 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             continue;
         }
         for (size_t i = 0; i < nd; i++) {
-            if (dev == llama_model_get_device(model, i)) {
+            ggml_backend_dev_t model_dev = llama_model_get_device(model, i);
+            // meta devices report their static buffers per sub-device and meta compute buffers have
+            // one buffer per sub-device of the same size, map those back to the meta device:
+            if (dev == model_dev ||
+                (ggml_backend_dev_is_meta(model_dev) &&
+                    [&]{
+                        for (size_t j = 0; j < ggml_backend_meta_dev_n_devs(model_dev); j++) {
+                            if (dev == ggml_backend_meta_dev_simple_dev(model_dev, j)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }())) {
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
@@ -818,9 +832,25 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     //const auto & devices = ctx->get_model().devices;
     const auto * model = llama_get_model(ctx);
 
-    std::vector<ggml_backend_dev_t> devices;
+    // use the simple sub-devices of meta devices so that the memory of tensor-parallel
+    // models is reported per physical device instead of for the virtual meta device:
+    struct device_entry {
+        ggml_backend_dev_t dev;
+        size_t             meta_idx; // index into meta_devices or SIZE_MAX for regular devices
+    };
+    std::vector<device_entry>          devices;
+    std::vector<ggml_backend_dev_t>    meta_devices;
     for (int i = 0; i < llama_model_n_devices(model); i++) {
-        devices.push_back(llama_model_get_device(model, i));
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (ggml_backend_dev_is_meta(dev)) {
+            const size_t meta_idx = meta_devices.size();
+            meta_devices.push_back(dev);
+            for (size_t j = 0; j < ggml_backend_meta_dev_n_devs(dev); j++) {
+                devices.push_back({ggml_backend_meta_dev_simple_dev(dev, j), meta_idx});
+            }
+        } else {
+            devices.push_back({dev, SIZE_MAX});
+        }
     }
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
@@ -843,9 +873,37 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     std::vector<llama_memory_breakdown_data> mb_dev(devices.size());
     llama_memory_breakdown_data              mb_host;
 
+    auto find_device = [&](ggml_backend_dev_t dev) -> int {
+        for (size_t i = 0; i < devices.size(); i++) {
+            if (devices[i].dev == dev) {
+                return (int) i;
+            }
+        }
+        return -1;
+    };
+
     for (const auto & buft_mb : memory_breakdown) {
         ggml_backend_buffer_type_t          buft = buft_mb.first;
         const llama_memory_breakdown_data & mb   = buft_mb.second;
+        if (ggml_backend_buft_is_meta(buft)) {
+            // static buffers are already decomposed into simple buffer types via llama_memory_breakdown_add,
+            // only the compute buffer size reported by the scheduler is still attributed to the meta buffer type,
+            // its per-device buffers are all of the same size:
+            if (mb.compute > 0) {
+                const size_t n = ggml_backend_meta_buft_n_bufts(buft);
+                for (size_t s = 0; s < n; s++) {
+                    ggml_backend_dev_t dev = ggml_backend_meta_buft_get_device(buft, s);
+                    if (dev != nullptr) {
+                        const int i_dev = find_device(dev);
+                        if (i_dev != -1) {
+                            mb_dev[i_dev].compute += mb.compute;
+                        }
+                    }
+                }
+            }
+            seen_buffer_types.insert(buft);
+            continue;
+        }
         if (ggml_backend_buft_is_host(buft)) {
             mb_host.model   += mb.model;
             mb_host.context += mb.context;
@@ -855,13 +913,7 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         }
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
         if (dev) {
-            int i_dev = -1;
-            for (size_t i = 0; i < devices.size(); i++) {
-                if (devices[i] == dev) {
-                    i_dev = i;
-                    break;
-                }
-            }
+            const int i_dev = find_device(dev);
             if (i_dev != -1) {
                 mb_dev[i_dev].model   += mb.model;
                 mb_dev[i_dev].context += mb.context;
@@ -874,7 +926,7 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 
     // print memory breakdown for each device:
     for (size_t i = 0; i < devices.size(); i++) {
-        ggml_backend_dev_t dev = devices[i];
+        ggml_backend_dev_t dev = devices[i].dev;
         llama_memory_breakdown_data mb = mb_dev[i];
 
         const std::string name = ggml_backend_dev_name(dev);
@@ -883,6 +935,9 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
             if (desc.length() >= prefix.length() && desc.substr(0, prefix.length()) == prefix) {
                 desc = desc.substr(prefix.length());
             }
+        }
+        if (devices[i].meta_idx != SIZE_MAX) {
+            desc += " (part of " + std::string(ggml_backend_dev_name(meta_devices[devices[i].meta_idx])) + ")";
         }
 
         size_t free, total;

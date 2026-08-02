@@ -1,7 +1,9 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "ggml-backend.h"
 
+#include <map>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -103,3 +105,12 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+
+// add the size of a buffer to a per-buffer-type breakdown, meta buffers are decomposed into their simple per-device buffers:
+void llama_memory_breakdown_add(std::map<ggml_backend_buffer_type_t, size_t> & ret, ggml_backend_buffer_t buf);
+
+// log the size of a buffer as one line per device, for meta buffers one line per simple sub-device is printed:
+void llama_log_buffer_size(const char * func, ggml_backend_buffer_t buf, const char * what, int name_width);
+
+// same as above but for a buffer type and a size (e.g. the compute buffer reservation reported by the scheduler):
+void llama_log_buft_size(const char * func, ggml_backend_buffer_type_t buft, size_t size, const char * what, int name_width);

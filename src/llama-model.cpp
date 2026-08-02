@@ -1681,8 +1681,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // print memory requirements per buffer type
     for (auto & [_, bufs] : pimpl->ctxs_bufs) {
         for (auto & buf: bufs) {
-            LLAMA_LOG_INFO("%s: %12s model buffer size = %8.2f MiB\n",
-                __func__, ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get()) / 1024.0 / 1024.0);
+            llama_log_buffer_size(__func__, buf.get(), "model", 12);
         }
     }
 
@@ -1765,8 +1764,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
             for (const auto & buf : bufs) {
-                // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-                ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+                llama_memory_breakdown_add(ret, buf.get());
             }
         }
     }

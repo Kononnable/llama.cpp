@@ -1,5 +1,6 @@
 #include "llama-impl.h"
 
+#include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
 
@@ -167,5 +168,61 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
             }
         default:
             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
+    }
+}
+
+void llama_memory_breakdown_add(std::map<ggml_backend_buffer_type_t, size_t> & ret, ggml_backend_buffer_t buf) {
+    if (!ggml_backend_buffer_is_meta(buf)) {
+        ret[ggml_backend_buffer_get_type(buf)] += ggml_backend_buffer_get_size(buf);
+        return;
+    }
+
+    // meta buffers hand out one simple buffer per device, report those individually
+    // instead of the meta buffer whose size is only the max of the simple buffer sizes:
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buf);
+    for (size_t i = 0; i < n_bufs; i++) {
+        ggml_backend_buffer_t simple_buf = ggml_backend_meta_buffer_simple_buffer(buf, i);
+        if (simple_buf != nullptr) {
+            ret[ggml_backend_buffer_get_type(simple_buf)] += ggml_backend_buffer_get_size(simple_buf);
+        }
+    }
+}
+
+void llama_log_buffer_size(const char * func, ggml_backend_buffer_t buf, const char * what, int name_width) {
+    if (!ggml_backend_buffer_is_meta(buf)) {
+        LLAMA_LOG_INFO("%s: %*s %s buffer size = %8.2f MiB\n", func, name_width,
+            ggml_backend_buffer_name(buf), what, ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        return;
+    }
+
+    // meta buffer: report one line per simple sub-device instead of the meta buffer itself,
+    // the size of the meta buffer is just the max of the simple buffer sizes:
+    const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buf);
+    std::vector<size_t> sizes(n_bufs);
+    ggml_backend_meta_buffer_get_simple_sizes(buf, sizes.data());
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+    for (size_t i = 0; i < n_bufs; i++) {
+        ggml_backend_dev_t dev = ggml_backend_meta_buft_get_device(buft, i);
+        const std::string name = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(ggml_backend_meta_buft_simple_buft(buft, i));
+        LLAMA_LOG_INFO("%s: %*s %s buffer size = %8.2f MiB (part of %s)\n", func, name_width,
+            name.c_str(), what, sizes[i]/1024.0/1024.0, ggml_backend_buffer_name(buf));
+    }
+}
+
+void llama_log_buft_size(const char * func, ggml_backend_buffer_type_t buft, size_t size, const char * what, int name_width) {
+    if (!ggml_backend_buft_is_meta(buft)) {
+        LLAMA_LOG_INFO("%s: %*s %s buffer size = %8.2f MiB\n", func, name_width,
+            ggml_backend_buft_name(buft), what, size/1024.0/1024.0);
+        return;
+    }
+
+    // meta buffer type: report one line per sub-device instead of the meta buffer type itself,
+    // the size is the same on all sub-devices:
+    const size_t n_bufts = ggml_backend_meta_buft_n_bufts(buft);
+    for (size_t i = 0; i < n_bufts; i++) {
+        ggml_backend_dev_t dev = ggml_backend_meta_buft_get_device(buft, i);
+        const std::string name = dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(ggml_backend_meta_buft_simple_buft(buft, i));
+        LLAMA_LOG_INFO("%s: %*s %s buffer size = %8.2f MiB (part of %s)\n", func, name_width,
+            name.c_str(), what, size/1024.0/1024.0, ggml_backend_buft_name(buft));
     }
 }
