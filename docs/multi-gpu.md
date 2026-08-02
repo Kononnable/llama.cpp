@@ -104,8 +104,14 @@ llama-cli -m moe-model.gguf -sm tensor -ts 1,2,2e,3e
 Here devices 0 and 1 (GPUs) split non-expert weights in a 1:2 ratio; devices 2 and 3 (CPUs,
 often remote via `--rpc`) split expert weights in a 2:3 ratio. Notes:
 
-- Requires a MoE model; using `e` with a dense model is an error.
+- Requires a MoE model and `-sm tensor`; using `e` with a dense model or a different split mode is an error.
 - Cannot be combined with `-cmoe`/`-ncmoe` or `-ot` expert overrides.
+- The entry count must match the devices: one plain entry per GPU-type device, then one `e` entry per
+  CPU-type device. The CPU pool is every CPU-type `--rpc` server plus the local CPU, which is always
+  added (also with an explicit `-dev` list) and sits last in the order. Pass `0e` for a CPU slot you
+  want to leave empty, e.g. `-ts 1,2,2e,3e,0e` disables the local CPU for two RPC expert devices.
+- Options parse left-to-right: pass `--rpc` (and `-sm tensor`, and `-dev` if used) before `-ts`,
+  otherwise the RPC servers are not yet visible to the count check.
 
 ### 5. With NCCL
 

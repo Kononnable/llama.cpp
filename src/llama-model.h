@@ -9,6 +9,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -564,6 +565,25 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+
+    // split-state computation is not thread-safe: the carry below makes it stateful, and the
+    // same tensor can be asked about from multiple loader threads concurrently - hold this
+    // mutex around the whole llama_meta_device_get_split_state() body
+    std::mutex split_state_mutex;
+
+    // see llama_meta_device_get_split_state(): per-tensor-row allocations are quantized to
+    // device-block granularity, the residual of the requested share is carried over to the
+    // next same-kind tensor
+    struct split_state_carry {
+        std::vector<double>  target; // cumulative exact rows per device
+        std::vector<int64_t> alloc;  // cumulative block-aligned rows per device
+    };
+    std::map<std::string, split_state_carry> split_carries;
+
+    // the same tensor can be queried more than once (weight buffer sizing vs. compute graph
+    // building) - replaying the recorded result instead of accumulating its share again keeps
+    // the split idempotent
+    std::map<std::string, std::vector<int64_t>> split_replays;
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);

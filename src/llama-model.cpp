@@ -33,6 +33,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -351,9 +352,13 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
-    const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+    llama_meta_device_get_split_state_userdata * ud = (llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+
+    // the carry state makes this function stateful, and loader threads can ask about the same
+    // tensor concurrently - serialize everything
+    std::lock_guard<std::mutex> lock(ud->split_state_mutex);
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -681,47 +686,140 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
 
+        // the same tensor can be queried more than once (weight buffer sizing vs. compute graph
+        // building) - replay the recorded rows instead of accumulating its share again
+        const auto it_replay = ud->split_replays.find(tensor_name);
+        if (it_replay != ud->split_replays.end()) {
+            const std::vector<int64_t> & replay_ne = it_replay->second;
+            GGML_ASSERT(replay_ne.size() % ud->n_devices == 0);
+            split_state.n_segments = (int) (replay_ne.size()/ud->n_devices);
+            memcpy(split_state.ne, replay_ne.data(), replay_ne.size()*sizeof(int64_t));
+            // nr was not recorded; the segments for a tensor are deterministic for a given model
+            // and axis, so get them again (cheap) instead
+            const auto segments = get_split_segments(split_state.axis, tc.il);
+            GGML_ASSERT(segments.size() == split_state.n_segments);
+            for (size_t is = 0; is < segments.size(); is++) {
+                split_state.nr[is] = segments[is].second;
+            }
+            return split_state;
+        }
+
         // tensor_split can hold "expert" entries marked negative (set by -ts ...,2e,3e):
         // expert-weight tensors use only the magnitudes of the negative entries, everything
         // else (attn/non-expert/KV/compute/etc.) gets only the plain positive fractions.
         const bool tensor_is_expert = std::regex_search(tensor_name, std::regex("_exps"));
-        std::vector<float> tensor_split_scan;
-        tensor_split_scan.reserve(ud->n_devices);
-        for (size_t j = 0; j < ud->n_devices; j++) {
-            if (!tensor_split) {
-                tensor_split_scan.push_back(0.0f);
-            } else if (tensor_is_expert) {
-                const float v = tensor_split[(j + tc.rotation) % ud->n_devices];
-                tensor_split_scan.push_back(v < 0.0f ? -v : 0.0f);
-            } else {
-                const float v = tensor_split[(j + tc.rotation) % ud->n_devices];
-                tensor_split_scan.push_back(v > 0.0f ? v : 0.0f);
-            }
-            if (j > 0) {
-                tensor_split_scan[j] += tensor_split_scan[j - 1];
+
+        static bool debug_split = getenv("GGML_META_DEBUG_SPLIT") != nullptr;
+        if (debug_split) {
+            static std::set<std::string> debug_seen;
+            if (debug_seen.size() < 20000 && debug_seen.insert(tensor_name).second) {
+                std::string raw;
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    raw += std::to_string(tensor_split ? tensor_split[j] : 0.0f) + " ";
+                }
+                LLAMA_LOG_INFO("%s[%s]: axis=%d il=%u rot=%zu ts=[%s]\n",
+                        __func__, tensor_name.c_str(), (int) split_state.axis, tc.il, tc.rotation, raw.c_str());
             }
         }
+
+        // requested per-device share for this tensor, without the per-tensor slot rotation
+        double share_total = 0.0;
+        std::vector<double> shares(ud->n_devices, 0.0);
+        for (size_t j = 0; j < ud->n_devices; j++) {
+            if (tensor_split) {
+                const float v = tensor_split[j];
+                shares[j] = tensor_is_expert ? (v < 0.0f ? -v : 0.0) : (v > 0.0f ? v : 0.0);
+            }
+            share_total += shares[j];
+        }
+        if (share_total == 0.0) {
+            // unsplit (or zero-split) tensors: equal shares everywhere
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                shares[j] = 1.0/ud->n_devices;
+            }
+            share_total = 1.0;
+        }
+
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+
+        // a per-layer share of a tensor can be smaller than the split granularity (e.g. expert
+        // weights of small MoE models), in which case rounding every tensor boundary down to whole
+        // blocks destroys the requested -ts proportions entirely. instead, accumulate the ideal
+        // per-device boundary across same-kind tensors (keyed by the per-layer tensor suffix) and
+        // quantize only the cumulative boundaries to whole blocks - every boundary stays
+        // block-aligned while over the stack of tensors the split follows the requested proportions
+        auto & split_carries = ud->split_carries;
+
+        std::string tensor_kind = tensor_name;
+        if (tensor_name.compare(0, 4, "blk.") == 0) {
+            tensor_kind = tensor_name.substr(tensor_name.find('.', 4) + 1);
+        } else if (tensor_name.compare(0, 6, "cache_") == 0) {
+            tensor_kind = tensor_name.substr(0, tensor_name.rfind("_l"));
+        }
+
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
             const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
-                }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
-                low = high;
+            const std::string key = format("%s|%d|%d", tensor_kind.c_str(), (int) split_state.axis, (int) is);
+
+            auto & st = split_carries[key];
+            if (st.target.empty()) {
+                st.target.assign(ud->n_devices, 0.0);
+                st.alloc.assign(ud->n_devices, 0);
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
+            std::vector<int64_t> ne_s_dev(ud->n_devices);
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                st.target[j] += ne_s * shares[j]/share_total;
+                const int64_t target_alloc = (int64_t) (st.target[j]/g_s)*g_s;
+                ne_s_dev[j] = target_alloc - st.alloc[j];
+                st.alloc[j] = target_alloc;
+            }
+            // hand out the remaining whole blocks to the devices with the largest deficit
+            int64_t left = ne_s;
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                left -= ne_s_dev[j];
+            }
+            while (left >= g_s) {
+                size_t slot_max = 0;
+                for (size_t j = 1; j < ud->n_devices; j++) {
+                    if (st.target[j] - (double) st.alloc[j] > st.target[slot_max] - (double) st.alloc[slot_max]) {
+                        slot_max = j;
+                    }
+                }
+                ne_s_dev[slot_max] += g_s;
+                st.alloc[slot_max] += g_s;
+                left -= g_s;
+            }
+            if (left != 0) {
+                // quantizing to whole g_s blocks should drain the remainder exactly; fall back to
+                // lumping it to the last device rather than silently dropping model data
+                LLAMA_LOG_WARN("%s: %s: segment %zu: %lld rows do not add up across devices\n",
+                        __func__, tensor_name.c_str(), is, (long long) left);
+                ne_s_dev[ud->n_devices - 1] += left;
+            }
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                split_state.ne[is*ud->n_devices + j] = ne_s_dev[j];
+            }
             split_state.nr[is] = nr_s;
         }
+        if (debug_split) {
+            static std::set<std::string> debug_seen_ne;
+            if (debug_seen_ne.size() < 20000 && debug_seen_ne.insert(tensor_name).second) {
+                std::string out;
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    out += std::to_string(split_state.ne[j]) + " ";
+                }
+                LLAMA_LOG_INFO("%s[%s]: exp=%d ne=[%s]\n", __func__, tensor_name.c_str(), (int) tensor_is_expert, out.c_str());
+            }
+        }
         split_state.n_segments = segments.size();
+        // remember the exact per-segment/per-device rows for the case the same tensor gets
+        // queried again (weight buffer sizing vs. compute graph building)
+        std::vector<int64_t> replay_ne(segments.size()*ud->n_devices);
+        memcpy(replay_ne.data(), split_state.ne, replay_ne.size()*sizeof(int64_t));
+        ud->split_replays.emplace(tensor_name, std::move(replay_ne));
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;

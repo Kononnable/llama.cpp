@@ -150,27 +150,48 @@ int64_t llama_time_us(void) {
 }
 
 // returns true on success
+static bool llama_model_has_expert_split(const llama_model_params & params) {
+    if (params.tensor_split == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < llama_max_devices(); ++i) {
+        if (params.tensor_split[i] < 0.0f) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-            size_t n_devs = 0;
-            while (params.devices[n_devs]) {
-                n_devs++;
+            // copy the array - expert splits (-ts 'e' entries) may append the local CPU below
+            std::vector<ggml_backend_dev_t> devs;
+            while (params.devices[devs.size()]) {
+                devs.push_back(params.devices[devs.size()]);
             }
-            if (n_devs == 0) {
+            if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
-            for (size_t i = 0; i < n_devs; ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+            if (llama_model_has_expert_split(params)) {
+                // keep at most one copy of the local CPU device, appended last
+                ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (cpu_dev != nullptr && std::find(devs.begin(), devs.end(), cpu_dev) == devs.end()) {
+                    devs.push_back(cpu_dev);
+                }
+                LLAMA_LOG_INFO("%s: including the local CPU device for the expert split\n", __func__);
             }
-            model->get_split_state_ud.n_devices = n_devs;
+            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, devs.size());
+            for (size_t i = 0; i < devs.size(); ++i) {
+                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(devs[i]));
+            }
+            model->get_split_state_ud.n_devices = devs.size();
             model->get_split_state_ud.model = model;
             model->devices.push_back({
                 true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
@@ -195,6 +216,20 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     continue;
                 }
                 devs.push_back(dev);
+            }
+            if (llama_model_has_expert_split(params)) {
+                // expert ('e') split entries target CPU devices by position - RPC CPU servers are already
+                // in the list (they have their own buffer type), append the local CPU last if missing;
+                // a trailing 0e entry disables it on the user's side
+                for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    auto * dev = ggml_backend_dev_get(i);
+                    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||
+                        std::find(devs.begin(), devs.end(), dev) != devs.end()) {
+                        continue;
+                    }
+                    LLAMA_LOG_INFO("%s: including %s (%s) in tensor parallelism for the expert split\n", __func__, ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
+                    devs.push_back(dev);
+                }
             }
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
@@ -347,13 +382,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
 
         // -ts entries with the 'e' (expert) marker request expert-only offloading; that only
-        // applies to MoE models
-        if (params.tensor_split != nullptr && model->hparams.n_expert <= 1) {
-            for (size_t i = 0; i < llama_max_devices(); ++i) {
-                if (params.tensor_split[i] < 0.0f) {
-                    throw std::runtime_error(
-                        "tensor split with expert markers ('e') requires a MoE model");
-                }
+        // applies to MoE models in tensor split mode
+        if (llama_model_has_expert_split(params)) {
+            if (model->hparams.n_expert <= 1) {
+                throw std::runtime_error("tensor split with expert markers ('e') requires a MoE model");
+            }
+            if (params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                throw std::runtime_error("tensor split with expert markers ('e') requires tensor split mode");
             }
         }
         try {
