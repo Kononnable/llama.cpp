@@ -1603,6 +1603,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
     mparams.main_gpu        = params.main_gpu;
+    mparams.n_cpu_moe       = params.n_cpu_moe < 0 ? 0 : params.n_cpu_moe;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;

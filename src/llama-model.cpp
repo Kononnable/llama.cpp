@@ -704,10 +704,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return split_state;
         }
 
-        // tensor_split can hold "expert" entries marked negative (set by -ts ...,2e,3e):
-        // expert-weight tensors use only the magnitudes of the negative entries, everything
-        // else (attn/non-expert/KV/compute/etc.) gets only the plain positive fractions.
+        // tensor_split can hold plain and (negated, 'e'-suffixed) expert entries; the share set
+        // an expert-weight tensor draws from additionally depends on its layer once n_cpu_moe > 0
         const bool tensor_is_expert = std::regex_search(tensor_name, std::regex("_exps"));
+
+        // expert ('e') entries only exist in tensor_split when the user asked for them;
+        // n_cpu_moe keeps its usual meaning of "the first N layers' experts stay on CPU" -
+        // layers [0, n_cpu_moe) split experts across the 'e' entries, the remaining layers
+        // across the plain (GPU) ones. both sides of the hand-off use the same telescoping
+        // carry below, so the boundary stays block-aligned automatically
+        int32_t il_expert = -1;
+        if (ud->has_expert && ud->n_cpu_moe > 0 && tensor_is_expert && tensor_name.compare(0, 4, "blk.") == 0) {
+            const size_t dot = tensor_name.find('.', 4);
+            if (dot != std::string::npos) {
+                il_expert = (int32_t) std::stoul(tensor_name.substr(4, dot - 4));
+            }
+        }
+
+        bool use_expert_split;
+        if (ud->has_expert) {
+            // il_expert stays -1 when layer gating is disabled or the tensor carries no layer
+            // tag - in both cases the tensor follows the expert share set, as before
+            use_expert_split = tensor_is_expert && (il_expert < 0 || il_expert < ud->n_cpu_moe);
+        } else {
+            use_expert_split = false;
+        }
 
         static bool debug_split = getenv("GGML_META_DEBUG_SPLIT") != nullptr;
         if (debug_split) {
@@ -728,7 +749,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         for (size_t j = 0; j < ud->n_devices; j++) {
             if (tensor_split) {
                 const float v = tensor_split[j];
-                shares[j] = tensor_is_expert ? (v < 0.0f ? -v : 0.0) : (v > 0.0f ? v : 0.0);
+                shares[j] = use_expert_split ? (v < 0.0f ? -v : 0.0) : (v > 0.0f ? v : 0.0);
             }
             share_total += shares[j];
         }
@@ -2583,6 +2604,7 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
+        /*.n_cpu_moe                   =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,

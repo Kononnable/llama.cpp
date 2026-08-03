@@ -2674,17 +2674,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
-        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU; "
+        "with -sm tensor and expert '-ts e' entries instead splits them across the 'e' (CPU) entries "
+        "while the remaining layers' experts follow the GPU (plain) entries",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            for (int i = 0; i < value; ++i) {
-                // keep strings alive and avoid leaking memory by storing them in a static vector
-                static std::list<std::string> buft_overrides;
-                buft_overrides.push_back(llm_ffn_exps_block_regex(i));
-                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type()});
+            // detect whether a tensor split with expert ('e') entries was already seen; in that
+            // case the split-layer logic of the meta device implements the semantics and no
+            // buffer overrides are wanted - scanning the array directly keeps the check immune
+            // to option order
+            bool expert_split_seen = false;
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                if (params.tensor_split[i] < 0.0f) {
+                    expert_split_seen = true;
+                    break;
+                }
             }
+            if (!expert_split_seen) {
+                for (int i = 0; i < value; ++i) {
+                    // keep strings alive and avoid leaking memory by storing them in a static vector
+                    static std::list<std::string> buft_overrides;
+                    buft_overrides.push_back(llm_ffn_exps_block_regex(i));
+                    params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type()});
+                }
+            }
+            params.n_cpu_moe = value;
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
@@ -2737,7 +2753,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "across the plain (GPU) entries in proportion 1:2, expert weights across the 'e' (CPU) entries in "
         "proportion 2:3. Plain entries must number exactly the available GPU devices; 'e' entries must number "
         "exactly the CPU devices (local CPU plus CPU-type --rpc servers registered before -ts); use 0e to "
-        "disable the local CPU slot. Mixing 'e' forms with -ncmoe/-cmoe/-ot expert overrides is an error.",
+        "disable the local CPU slot. With 'e' entries, -ncmoe N keeps the expert weights of the first N "
+        "layers on the 'e' (CPU) entries and moves the remaining layers' experts to the plain (GPU) "
+        "entries; -cmoe/-ot expert overrides cannot be combined with 'e' forms.",
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 
@@ -2856,12 +2874,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                             "(local CPU plus CPU-type RPC servers registered so far; pass --rpc before -ts, use 0e to disable a slot)",
                             n_expert_entries, n_cpu_pool));
                 }
-                // the buffer-override based MoE offloading mixes concepts with the grouped split
-                if (!params.tensor_buft_overrides.empty() ||
-                    !params.speculative.draft.tensor_buft_overrides.empty()) {
+                // the buffer-override based MoE offloading mixes concepts with the grouped split;
+                // --n-cpu-moe/-ncmoe (which normally works through such overrides) is the one
+                // exception - with expert split entries it is re-interpreted as the number of
+                // layers whose experts stay on the plain (GPU) devices, handled inside the meta
+                // device split. its per-layer overrides are dropped here; -cmoe and expert -ot
+                // rules (identifiable as non-matching patterns) remain an error
+                if (params.n_cpu_moe > 0 && !params.tensor_buft_overrides.empty()) {
+                    auto & overrides = params.tensor_buft_overrides;
+                    size_t i = 0;
+                    while (i < overrides.size() && overrides[i].pattern != nullptr) {
+                        if (overrides[i].buft != ggml_backend_cpu_buffer_type()) {
+                            ++i;
+                            continue;
+                        }
+                        bool from_ncmoe = false;
+                        for (int l = 0; l < params.n_cpu_moe; ++l) {
+                            if (overrides[i].pattern == std::string(llm_ffn_exps_block_regex(l))) {
+                                from_ncmoe = true;
+                                break;
+                            }
+                        }
+                        if (from_ncmoe) {
+                            overrides.erase(overrides.begin() + i);
+                        } else {
+                            ++i;
+                        }
+                    }
+                }
+                if (!params.tensor_buft_overrides.empty() && params.tensor_buft_overrides[0].pattern != nullptr) {
                     throw std::invalid_argument(
-                        "tensor split with '-e' cannot be combined with --cpu-moe/-cmoe, --n-cpu-moe/-ncmoe, "
-                        "or expert --override-tensor/-ot rules; use one mechanism or the other");
+                        "tensor split with '-e' cannot be combined with --cpu-moe/-cmoe "
+                        "or expert --override-tensor/-ot rules");
+                }
+                if (!params.speculative.draft.tensor_buft_overrides.empty()) {
+                    throw std::invalid_argument(
+                        "tensor split with '-e' cannot be combined with draft-model --cpu-moe/-ncmoe "
+                        "or expert --override-tensor/-ot rules");
                 }
             }
             if (!llama_supports_gpu_offload()) {

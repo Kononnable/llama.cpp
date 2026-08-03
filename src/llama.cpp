@@ -164,6 +164,10 @@ static bool llama_model_has_expert_split(const llama_model_params & params) {
 
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
+    if (params.n_cpu_moe > 0 && (params.split_mode != LLAMA_SPLIT_MODE_TENSOR || !llama_model_has_expert_split(params))) {
+        LLAMA_LOG_ERROR("%s: n_cpu_moe > 0 requires LLAMA_SPLIT_MODE_TENSOR combined with expert ('e') tensor_split entries\n", __func__);
+        return false;
+    }
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             // copy the array - expert splits (-ts 'e' entries) may append the local CPU below
@@ -187,8 +191,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (size_t i = 0; i < devs.size(); ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(devs[i]));
             }
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model = model;
+            model->get_split_state_ud.n_devices  = devs.size();
+            model->get_split_state_ud.model      = model;
+            model->get_split_state_ud.n_cpu_moe  = params.n_cpu_moe;
+            model->get_split_state_ud.has_expert = llama_model_has_expert_split(params);
             model->devices.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
@@ -242,8 +248,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
+            model->get_split_state_ud.n_devices  = devs.size();
+            model->get_split_state_ud.model      = model;
+            model->get_split_state_ud.n_cpu_moe  = params.n_cpu_moe;
+            model->get_split_state_ud.has_expert = llama_model_has_expert_split(params);
             gpus.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)

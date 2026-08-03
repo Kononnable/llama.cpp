@@ -566,6 +566,13 @@ struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
 
+    // mirrors the usual -ncmoe meaning of "first N layers' experts on CPU": expert tensors of
+    // layers [0, n_cpu_moe) split across the CPU ('e') split entries, the remaining layers
+    // across the plain (GPU) entries; active only when has_expert is set (tensor_split actually
+    // contains 'e' entries) - without them there is only one share set that everything rides on
+    int32_t n_cpu_moe  = 0;
+    bool    has_expert = false;
+
     // split-state computation is not thread-safe: the carry below makes it stateful, and the
     // same tensor can be asked about from multiple loader threads concurrently - hold this
     // mutex around the whole llama_meta_device_get_split_state() body

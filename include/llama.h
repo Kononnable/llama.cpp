@@ -318,6 +318,12 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // with split_mode == LLAMA_SPLIT_MODE_TENSOR and expert ('e'-marked) tensor_split entries:
+        // layers [0, n_cpu_moe) keep their expert (MoE) weights on the CPU ('e') entries, the
+        // remaining layers split expert weights across the plain (GPU) entries. 0 = all expert
+        // weights follow the 'e' entries; has no effect without expert tensor_split entries.
+        int32_t n_cpu_moe;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
