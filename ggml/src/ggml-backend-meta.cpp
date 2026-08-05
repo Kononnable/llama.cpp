@@ -4,6 +4,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-rpc.h"
 
 #include <algorithm>
 #include <cassert>
@@ -2170,31 +2171,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             return GGML_STATUS_SUCCESS;
         }
 
-        // Zero out nodes that were disabled due to having a zero-sized slice:
-        for (size_t j = 0; j < n_backends; j++) {
-            auto & bcj = backend_ctx->backend_configs[j];
-            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
-            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                continue;
-            }
-            ggml_tensor * node_zero = get_node_aux(node);
-            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
-            node_zero->src[0] = node;
-            ggml_set_op_params_f32(node_zero, 0, 0.0f);
-            node_zero->data = node->data;
-            node_zero->buffer = node->buffer;
-            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
-
-            step_cgraphs[j] = get_cgraph_aux();
-            step_cgraphs[j]->nodes[0] = node_zero;
-            step_cgraphs[j]->n_nodes = 1;
-            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
-            if (status != GGML_STATUS_SUCCESS) {
-                return status;
-            }
-        }
-        std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
-
         auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
@@ -2224,6 +2200,83 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             cgraph_aux->n_nodes = 1;
             step_cgraphs[j_dst] = cgraph_aux;
         };
+
+        // If exactly two backends hold a non-zero slice and a third is empty (the common
+        // expert-FFN case), reduce the two holders into each other first, then copy the full
+        // result to the empty backend. This is 2 serial RPC hops instead of the 3-hop butterfly
+        // that walks through the empty backend. Same values end up on the same backends.
+        if (ar_map.size() == 2 && ar_map.size() == n_backends - 1) {
+            const size_t j_a = ar_map[0];
+            const size_t j_b = ar_map[1];
+
+            // Stage 1: exchange the partial sums so both holders end up with the full sum.
+            std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+            push_data(j_a, j_b, 0);
+            push_data(j_b, j_a, 0);
+            for (size_t j : {j_a, j_b}) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+
+            // Stage 2: copy the full value to the empty backend, preferring a local (non-RPC) source.
+            size_t j_zero = 0;
+            for (size_t j = 0; j < n_backends; j++) {
+                if (j != j_a && j != j_b) {
+                    j_zero = j;
+                    break;
+                }
+            }
+            size_t j_src = j_a;
+            for (size_t j : {j_a, j_b}) {
+                if (!ggml_backend_is_rpc(backend_ctx->backend_configs[j].backend)) {
+                    j_src = j;
+                    break;
+                }
+            }
+            auto & bcj_src = backend_ctx->backend_configs[j_src];
+            auto & bcj_dst = backend_ctx->backend_configs[j_zero];
+            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+
+            if (ggml_meta_perf_interval() >= 0) {
+                GGML_LOG_INFO("[meta-ar] two-stage reduce: holders=%s,%s src=%s zero=%s\n",
+                    ggml_backend_name(backend_ctx->backend_configs[j_a].backend),
+                    ggml_backend_name(backend_ctx->backend_configs[j_b].backend),
+                    ggml_backend_name(bcj_src.backend),
+                    ggml_backend_name(bcj_dst.backend));
+            }
+
+            return GGML_STATUS_SUCCESS;
+        }
+
+        // Zero out nodes that were disabled due to having a zero-sized slice:
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                continue;
+            }
+            ggml_tensor * node_zero = get_node_aux(node);
+            node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+            node_zero->src[0] = node;
+            ggml_set_op_params_f32(node_zero, 0, 0.0f);
+            node_zero->data = node->data;
+            node_zero->buffer = node->buffer;
+            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+            step_cgraphs[j] = get_cgraph_aux();
+            step_cgraphs[j]->nodes[0] = node_zero;
+            step_cgraphs[j]->n_nodes = 1;
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
         size_t offset_j = n_backends/2;
         while ((offset_j & (offset_j - 1)) != 0) {
