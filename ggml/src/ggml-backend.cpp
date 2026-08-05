@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <vector>
 
 #ifdef __APPLE__
@@ -1591,6 +1593,62 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// scheduler perf debug (GGML_SCHED_PERF)
+//   GGML_SCHED_PERF=0  report every token
+//   GGML_SCHED_PERF=N  report every N seconds (aggregating)
+// unset: disabled
+static int ggml_sched_perf_interval() {
+    static const int interval = []() {
+        const char * s = std::getenv("GGML_SCHED_PERF");
+        if (s == nullptr || s[0] == '\0') {
+            return -1;
+        }
+        return atoi(s);
+    }();
+    return interval;
+}
+
+struct ggml_sched_perf_backend {
+    int64_t copy_us    = 0;
+    int64_t compute_us = 0;
+};
+
+static std::map<ggml_backend_t, ggml_sched_perf_backend> ggml_sched_perf_accum;
+static std::mutex    ggml_sched_perf_mutex;
+static int64_t       ggml_sched_perf_t_last_report = ggml_time_us();
+static int           ggml_sched_perf_n_graphs = 0;
+
+// called with ggml_sched_perf_mutex held
+static void ggml_sched_perf_report() {
+    const int interval = ggml_sched_perf_interval();
+    const int64_t t_now = ggml_time_us();
+
+    // report every token (interval == 0) or after interval seconds
+    if (interval != 0 && (t_now - ggml_sched_perf_t_last_report) < interval*1000000LL) {
+        return;
+    }
+
+    char line[1024];
+    int off = 0;
+    for (const auto & it : ggml_sched_perf_accum) {
+        const ggml_backend_t backend = it.first;
+        const ggml_sched_perf_backend & d = it.second;
+        const double copy_ms    = 1e-3*d.copy_us;
+        const double compute_ms = 1e-3*d.compute_us;
+        const double total_ms   = copy_ms + compute_ms;
+        off += snprintf(line + off, sizeof(line) - off, " | %-10s copy=%7.2fms compute=%8.2fms total=%8.2fms",
+            ggml_backend_name(backend), copy_ms, compute_ms, total_ms);
+        if (off >= (int) sizeof(line) - 128) {
+            break;
+        }
+    }
+    GGML_LOG_INFO("[sched-perf] %d graphs%s\n", ggml_sched_perf_n_graphs, line);
+
+    ggml_sched_perf_accum.clear();
+    ggml_sched_perf_n_graphs = 0;
+    ggml_sched_perf_t_last_report = t_now;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1599,10 +1657,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    // per-graph accumulation of split wall-time attributed to each backend
+    std::map<ggml_backend_t, std::pair<int64_t,int64_t>> perf_graph; // backend -> {copy_us, compute_us}
+    const int perf_interval = ggml_sched_perf_interval();
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        const int64_t t_split_start = ggml_time_us();
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1727,6 +1791,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_compute_start = ggml_time_us();
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1766,12 +1832,37 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (perf_interval >= 0) {
+            // force sync so per-backend wall-time is measured accurately (only when perf is enabled)
+            ggml_backend_synchronize(split_backend);
+        }
+
+        const int64_t t_split_end = ggml_time_us();
+
+        if (perf_interval >= 0) {
+            auto & acc = perf_graph[split_backend];
+            acc.first  += t_compute_start - t_split_start;
+            acc.second += t_split_end   - t_compute_start;
+        }
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+    }
+
+    // merge per-graph timing and report when interval elapses
+    if (perf_interval >= 0) {
+        std::lock_guard<std::mutex> lock(ggml_sched_perf_mutex);
+        for (const auto & it : perf_graph) {
+            ggml_sched_perf_backend & d = ggml_sched_perf_accum[it.first];
+            d.copy_us    += it.second.first;
+            d.compute_us += it.second.second;
+        }
+        ggml_sched_perf_n_graphs++;
+        ggml_sched_perf_report();
     }
 
     return GGML_STATUS_SUCCESS;

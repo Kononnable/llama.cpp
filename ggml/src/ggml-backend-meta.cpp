@@ -10,9 +10,11 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -1789,6 +1791,58 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     }
 }
 
+// meta backend perf debug, same env var as the scheduler: GGML_SCHED_PERF
+//   0 = report every token, N = every N seconds; unset/empty = disabled
+static int ggml_meta_perf_interval() {
+    static const int interval = []() {
+        const char * s = std::getenv("GGML_SCHED_PERF");
+        if (s == nullptr || s[0] == '\0') {
+            return -1;
+        }
+        return atoi(s);
+    }();
+    return interval;
+}
+
+static std::map<ggml_backend_t, int64_t> ggml_meta_perf_compute_accum; // backend -> compute_us
+static int64_t ggml_meta_perf_allreduce_us = 0;
+static int64_t ggml_meta_perf_total_us     = 0;
+static int64_t ggml_meta_perf_t_last       = ggml_time_us();
+static int      ggml_meta_perf_n_graphs    = 0;
+static int      ggml_meta_perf_n_allreduce = 0;
+static std::mutex ggml_meta_perf_mutex;
+
+// called with ggml_meta_perf_mutex held
+static void ggml_meta_perf_report() {
+    const int interval = ggml_meta_perf_interval();
+    const int64_t t_now = ggml_time_us();
+    if (interval != 0 && (t_now - ggml_meta_perf_t_last) < interval*1000000LL) {
+        return;
+    }
+
+    char line[1024];
+    int off = 0;
+    for (const auto & it : ggml_meta_perf_compute_accum) {
+        off += snprintf(line + off, sizeof(line) - off, " | %-10s compute=%7.2fms",
+            ggml_backend_name(it.first), 1e-3*it.second);
+        if (off >= (int) sizeof(line) - 128) {
+            break;
+        }
+    }
+    GGML_LOG_INFO("[meta-perf] %d graphs (%d allreduce)%s | allreduce=%8.2fms (%5.2fms/ar) total=%8.2fms\n",
+        ggml_meta_perf_n_graphs, ggml_meta_perf_n_allreduce, line,
+        1e-3*ggml_meta_perf_allreduce_us,
+        ggml_meta_perf_n_allreduce > 0 ? 1e-3*ggml_meta_perf_allreduce_us/ggml_meta_perf_n_allreduce : 0.0,
+        1e-3*ggml_meta_perf_total_us);
+
+    ggml_meta_perf_compute_accum.clear();
+    ggml_meta_perf_allreduce_us = 0;
+    ggml_meta_perf_total_us     = 0;
+    ggml_meta_perf_n_graphs     = 0;
+    ggml_meta_perf_n_allreduce  = 0;
+    ggml_meta_perf_t_last       = t_now;
+}
+
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
@@ -2090,6 +2144,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     auto allreduce_fallback = [&](size_t i) -> ggml_status {
         std::vector<ggml_cgraph *> step_cgraphs(n_backends, nullptr);
 
+        // If only a single backend holds a non-zero slice of the reduced tensor, there is
+        // nothing to sum: this is just a broadcast of that value to the other backends.
+        // Do it directly (parallel copies) instead of running a wasteful multi-way butterfly.
+        std::vector<size_t> ar_map;
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                ar_map.push_back(j);
+            }
+        }
+        if (ar_map.size() == 1) {
+            const size_t j_src = ar_map[0];
+            auto & bcj_src = backend_ctx->backend_configs[j_src];
+            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
+            for (size_t j = 0; j < n_backends; j++) {
+                if (j == j_src) {
+                    continue;
+                }
+                auto & bcj_dst = backend_ctx->backend_configs[j];
+                ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
+                ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+            }
+            return GGML_STATUS_SUCCESS;
+        }
+
         // Zero out nodes that were disabled due to having a zero-sized slice:
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
@@ -2203,16 +2283,68 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
+    const int perf_interval = ggml_meta_perf_interval();
+    std::map<ggml_backend_t, int64_t> perf_compute_us; // device backend -> isolated compute time
+    int64_t perf_allreduce_us = 0;
+    int64_t perf_total_us     = 0;
+
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+        const int64_t t_i_start = ggml_time_us();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
+            const int64_t t_j_start = ggml_time_us();
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
             }
+            if (perf_interval >= 0) {
+                // measure isolated per-device compute time (syncs each backend)
+                ggml_backend_synchronize(bcj.backend);
+                perf_compute_us[bcj.backend] += ggml_time_us() - t_j_start;
+            }
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
+            if (perf_interval >= 0) {
+                ggml_tensor * ar_node = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+                char ar_line[1024]; int ar_off = 0;
+                ar_off += snprintf(ar_line + ar_off, sizeof(ar_line) - ar_off,
+                    "[meta-ar] subgraph %zu/%zu n_backends=%zu tensor=\"%s\" ne=[%lldx%lld] backends:",
+                    i, backend_ctx->n_subgraphs, n_backends, ar_node->name,
+                    (long long) ar_node->ne[0], (long long) ar_node->ne[1]);
+                for (size_t j = 0; j < n_backends; j++) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+                    ar_off += snprintf(ar_line + ar_off, sizeof(ar_line) - ar_off, " %s(%s)",
+                        ggml_backend_name(bcj.backend),
+                        (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "Y" : "-");
+                }
+                GGML_LOG_INFO("%s\n", ar_line);
+
+                // consumer trace: which nodes read this reduced tensor, and their split axis
+                ggml_tensor * red_orig = cgraph->nodes[backend_ctx->backend_configs[0].cgraphs[i+1].offset - 1];
+                GGML_LOG_INFO("[meta-ar]   consumers of \"%s\":", red_orig->name);
+                for (int ci = 0; ci < cgraph->n_nodes; ci++) {
+                    ggml_tensor * cnode = cgraph->nodes[ci];
+                    if (cnode == red_orig) {
+                        continue;
+                    }
+                    bool uses = false;
+                    for (int s = 0; s < GGML_MAX_SRC; s++) {
+                        if (cnode->src[s] == red_orig ||
+                            (cnode->src[s] != nullptr && cnode->src[s]->view_src == red_orig)) {
+                            uses = true;
+                            break;
+                        }
+                    }
+                    if (uses) {
+                        const ggml_backend_meta_split_state css = ggml_backend_meta_get_split_state(cnode, /*assume_sync =*/ false);
+                        GGML_LOG_INFO("[meta-ar]     node \"%s\" op=%s axis=%d\n",
+                            cnode->name, ggml_op_name(cnode->op), (int) css.axis);
+                    }
+                }
+            }
+            const int64_t t_ar_start = ggml_time_us();
             bool backend_allreduce_success = false;
             if (backend_ctx->comm_ctx) {
                 std::vector<ggml_tensor *> nodes;
@@ -2231,8 +2363,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     return status;
                 }
             }
+            perf_allreduce_us += ggml_time_us() - t_ar_start;
         }
+        perf_total_us += ggml_time_us() - t_i_start;
     }
+
+    if (perf_interval >= 0) {
+        std::lock_guard<std::mutex> lock(ggml_meta_perf_mutex);
+        for (const auto & it : perf_compute_us) {
+            ggml_meta_perf_compute_accum[it.first] += it.second;
+        }
+        ggml_meta_perf_allreduce_us += perf_allreduce_us;
+        ggml_meta_perf_total_us     += perf_total_us;
+        ggml_meta_perf_n_graphs++;
+        ggml_meta_perf_n_allreduce  += n_backends > 1 ? backend_ctx->n_subgraphs - 1 : 0;
+        ggml_meta_perf_report();
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
