@@ -2206,48 +2206,60 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // result to the empty backend. This is 2 serial RPC hops instead of the 3-hop butterfly
         // that walks through the empty backend. Same values end up on the same backends.
         if (ar_map.size() == 2 && ar_map.size() == n_backends - 1) {
-            const size_t j_a = ar_map[0];
-            const size_t j_b = ar_map[1];
-
-            // Stage 1: exchange the partial sums so both holders end up with the full sum.
-            std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
-            push_data(j_a, j_b, 0);
-            push_data(j_b, j_a, 0);
-            for (size_t j : {j_a, j_b}) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[j]);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
+            // Reduce on the local (non-RPC) holder, then broadcast the full value to the remote
+            // holder and the empty backend. This avoids running an ADD on the RPC backend, saving
+            // one graph_compute round-trip per expert allreduce. Same values end up everywhere.
+            size_t j_red = ar_map[0];
+            size_t j_rem = ar_map[1];
+            if (ggml_backend_is_rpc(backend_ctx->backend_configs[j_red].backend)) {
+                std::swap(j_red, j_rem);
             }
-
-            // Stage 2: copy the full value to the empty backend, preferring a local (non-RPC) source.
             size_t j_zero = 0;
             for (size_t j = 0; j < n_backends; j++) {
-                if (j != j_a && j != j_b) {
+                if (j != j_red && j != j_rem) {
                     j_zero = j;
                     break;
                 }
             }
-            size_t j_src = j_a;
-            for (size_t j : {j_a, j_b}) {
-                if (!ggml_backend_is_rpc(backend_ctx->backend_configs[j].backend)) {
-                    j_src = j;
-                    break;
-                }
+            auto & bcj_red  = backend_ctx->backend_configs[j_red];
+            auto & bcj_rem  = backend_ctx->backend_configs[j_rem];
+            auto & bcj_zero = backend_ctx->backend_configs[j_zero];
+
+            ggml_tensor * node_red  = bcj_red.cgraphs[i].cgraph_main->nodes[bcj_red.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_rem  = bcj_rem.cgraphs[i].cgraph_main->nodes[bcj_rem.cgraphs[i].cgraph_main->n_nodes - 1];
+            ggml_tensor * node_zero = bcj_zero.cgraphs[i].cgraph_main->nodes[bcj_zero.cgraphs[i].cgraph_main->n_nodes - 1];
+
+            // copy the remote partial into the reducer's tmp buffer
+            ggml_tensor * node_tmp = get_node_aux(node_red);
+            set_tmp_data(node_tmp, j_red, 0);
+            ggml_backend_tensor_copy_async(bcj_rem.backend, bcj_red.backend, node_rem, node_tmp);
+
+            // reducer adds its own partial -> full
+            ggml_tensor * node_red_full = get_node_aux(node_red);
+            node_red_full->view_src = node_red->view_src == nullptr ? node_red : node_red->view_src;
+            node_red_full->view_offs = node_red->view_offs;
+            node_red_full->op = GGML_OP_ADD;
+            node_red_full->src[0] = node_red;
+            node_red_full->src[1] = node_tmp;
+            node_red_full->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(node_red_full);
+            ggml_cgraph * cgraph_aux = get_cgraph_aux();
+            cgraph_aux->nodes[0] = node_red_full;
+            cgraph_aux->n_nodes = 1;
+            const ggml_status status = ggml_backend_graph_compute_async(bcj_red.backend, cgraph_aux);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
             }
-            auto & bcj_src = backend_ctx->backend_configs[j_src];
-            auto & bcj_dst = backend_ctx->backend_configs[j_zero];
-            ggml_tensor * node_src = bcj_src.cgraphs[i].cgraph_main->nodes[bcj_src.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_tensor * node_dst = bcj_dst.cgraphs[i].cgraph_main->nodes[bcj_dst.cgraphs[i].cgraph_main->n_nodes - 1];
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_dst);
+
+            // broadcast the full value to the remote holder and the empty backend
+            ggml_backend_tensor_copy_async(bcj_red.backend, bcj_rem.backend, node_red, node_rem);
+            ggml_backend_tensor_copy_async(bcj_red.backend, bcj_zero.backend, node_red, node_zero);
 
             if (ggml_meta_perf_interval() >= 0) {
-                GGML_LOG_INFO("[meta-ar] two-stage reduce: holders=%s,%s src=%s zero=%s\n",
-                    ggml_backend_name(backend_ctx->backend_configs[j_a].backend),
-                    ggml_backend_name(backend_ctx->backend_configs[j_b].backend),
-                    ggml_backend_name(bcj_src.backend),
-                    ggml_backend_name(bcj_dst.backend));
+                GGML_LOG_INFO("[meta-ar] local reduce: reduce=%s remote=%s zero=%s\n",
+                    ggml_backend_name(bcj_red.backend),
+                    ggml_backend_name(bcj_rem.backend),
+                    ggml_backend_name(bcj_zero.backend));
             }
 
             return GGML_STATUS_SUCCESS;
