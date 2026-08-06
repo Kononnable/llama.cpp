@@ -2796,7 +2796,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                         }
                         sum_expert_split += v;
                     } else {
-                        if (v <= 0.0f) {
+                        // a zero share is allowed: it disables that plain device (e.g. -ts 0,1),
+                        // while negatives stay rejected as the reserved expert ('e') sentinel
+                        if (v < 0.0f) {
                             throw std::invalid_argument(string_format("invalid tensor split value: '%s'", split_arg[i].c_str()));
                         }
                         params.tensor_split[i] = v;

@@ -2306,10 +2306,14 @@ static struct ggml_backend_dev_caps ggml_backend_rpc_device_caps(ggml_backend_de
             rpc_msg_get_dev_props_rsp response;
             bool status = send_rpc_cmd(sock, RPC_CMD_GET_DEV_PROPS, &request, sizeof(request), &response, sizeof(response));
             if (status) {
-                caps.async                = response.async;
-                caps.host_buffer          = response.host_buffer;
-                caps.buffer_from_host_ptr = response.buffer_from_host_ptr;
-                caps.events               = response.events;
+                caps.async = response.async;
+                // the RPC device iface does not implement host buffers, buffer_from_host_ptr or
+                // events (all NULL below); do not advertise capabilities the remote happens to
+                // have, or callers that trust these caps (e.g. the mmap loader path) will call a
+                // NULL function through the iface
+                caps.host_buffer          = false;
+                caps.buffer_from_host_ptr = false;
+                caps.events               = false;
                 // dev_type was added in proto 4.3
                 if (rpc_server_supports_dev_type(ctx->endpoint)) {
                     ctx->dev_type = static_cast<enum ggml_backend_dev_type>(response.dev_type);
