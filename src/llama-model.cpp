@@ -438,9 +438,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             rotation = hparams.n_layer() % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
-        if (tensor_axis_0 == nullptr) {
-            GGML_ASSERT(!suffix_fallback.empty());
+        if (tensor_axis_0 == nullptr && !suffix_fallback.empty()) {
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
+        }
+        if (tensor_axis_0 == nullptr) {
+            // hybrid architectures (e.g. GLM-4.5 dense+MoE layers) can lack the axis-0 anchor
+            // tensor of a layer (dense layers have no ffn_*_exps, MoE layers have no ffn_down.weight);
+            // the anchor is only used for the quant block size, fall back to the tensor itself
+            LLAMA_LOG_WARN("%s: %s: missing axis-0 anchor '%s%s' / '%s%s', using the tensor's own type\n",
+                    __func__, tensor_name.c_str(), prefix.c_str(), suffix.c_str(),
+                    prefix.c_str(), suffix_fallback.c_str());
+            tensor_axis_0 = tensor;
         }
         GGML_ASSERT(tensor_axis_0 != nullptr);
         return {axis, tensor_axis_0, il, rotation};
@@ -814,11 +822,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 left -= g_s;
             }
             if (left != 0) {
-                // quantizing to whole g_s blocks should drain the remainder exactly; fall back to
-                // lumping it to the last device rather than silently dropping model data
+                // quantizing to whole g_s blocks should drain the remainder exactly; give the leftover
+                // to the device with the largest deficit (like the drain above) and record it in the
+                // carry - lumping it on the last device without updating the carry made the accounting
+                // drift, producing alternating/negative slices on subsequent same-kind tensors
+                size_t slot_max = 0;
+                for (size_t j = 1; j < ud->n_devices; j++) {
+                    if (st.target[j] - (double) st.alloc[j] > st.target[slot_max] - (double) st.alloc[slot_max]) {
+                        slot_max = j;
+                    }
+                }
                 LLAMA_LOG_WARN("%s: %s: segment %zu: %lld rows do not add up across devices\n",
                         __func__, tensor_name.c_str(), is, (long long) left);
-                ne_s_dev[ud->n_devices - 1] += left;
+                ne_s_dev[slot_max] += left;
+                st.alloc[slot_max] += left;
             }
             for (size_t j = 0; j < ud->n_devices; j++) {
                 split_state.ne[is*ud->n_devices + j] = ne_s_dev[j];
