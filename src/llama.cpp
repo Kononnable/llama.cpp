@@ -164,10 +164,6 @@ static bool llama_model_has_expert_split(const llama_model_params & params) {
 
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
-    if (params.n_cpu_moe > 0 && (params.split_mode != LLAMA_SPLIT_MODE_TENSOR || !llama_model_has_expert_split(params))) {
-        LLAMA_LOG_ERROR("%s: n_cpu_moe > 0 requires LLAMA_SPLIT_MODE_TENSOR combined with expert ('e') tensor_split entries\n", __func__);
-        return false;
-    }
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             // copy the array - expert splits (-ts 'e' entries) may append the local CPU below
