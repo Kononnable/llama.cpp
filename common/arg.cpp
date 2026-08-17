@@ -2675,8 +2675,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU; "
-        "with -sm tensor and expert '-ts e' entries instead splits them across the 'e' (CPU) entries "
-        "while the remaining layers' experts follow the GPU (plain) entries",
+        "with -sm tensor and expert '-ts e' entries instead keeps them on the 'e' entries "
+        "while the remaining layers' experts follow the plain entries",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
@@ -2750,12 +2750,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1\n"
         "-sm tensor additionally supports 'e' suffixed entries, e.g. 1,2,2e,3e: non-expert weights are split "
-        "across the plain (GPU) entries in proportion 1:2, expert weights across the 'e' (CPU) entries in "
-        "proportion 2:3. Plain entries must number exactly the available GPU devices; 'e' entries must number "
-        "exactly the CPU devices (local CPU plus CPU-type --rpc servers registered before -ts); use 0e to "
-        "disable the local CPU slot. With 'e' entries, -ncmoe N keeps the expert weights of the first N "
-        "layers on the 'e' (CPU) entries and moves the remaining layers' experts to the plain (GPU) "
-        "entries; -cmoe/-ot expert overrides cannot be combined with 'e' forms.",
+        "across the plain entries in proportion 1:2, expert weights across the 'e' entries in proportion 2:3. "
+        "Each entry maps positionally to one device of the split (all devices except the local CPU in "
+        "registration order, the local CPU last) and every device independently takes a plain or 'e' entry, "
+        "so expert parts can target any device, including RPC GPU servers. Use 0e to disable a slot. With "
+        "'e' entries, -ncmoe N keeps the expert weights of the first N layers on the 'e' entries and moves "
+        "the remaining layers' experts to the plain entries; -cmoe/-ot expert overrides cannot be combined "
+        "with 'e' forms.",
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 
@@ -2821,65 +2822,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                         "tensor split with '-e' requires --split-mode tensor; note that options apply left-to-right, "
                         "so -sm tensor must appear before -ts");
                 }
-                // entry counts must match the devices actually usable for each side - plain entries map to
-                // GPU-type devices, 'e' entries to CPU-type devices (RPC CPU servers plus the local CPU);
-                // --rpc and -dev are only visible here when passed before -ts
-                size_t n_gpu_pool = 0;
-                size_t n_cpu_pool = 0;
-                auto count_pools = [&](ggml_backend_dev_t dev) {
-                    switch (ggml_backend_dev_type(dev)) {
-                        case GGML_BACKEND_DEVICE_TYPE_GPU:
-                        case GGML_BACKEND_DEVICE_TYPE_IGPU: n_gpu_pool++; break;
-                        case GGML_BACKEND_DEVICE_TYPE_CPU:   n_cpu_pool++; break;
-                        default: break;
-                    }
-                };
+                // every entry maps positionally to one device of the split, and every device takes exactly
+                // one entry - plain or 'e', independently of its type, so expert parts may target any device,
+                // including RPC GPU servers. the device order mirrors the meta device built at load time:
+                // - with an explicit -dev list: the listed devices in order, local CPU appended last
+                // - otherwise: every registered device except the local CPU, in registration order, local
+                //   CPU appended last; RPC servers register in the order passed to --rpc
+                std::vector<ggml_backend_dev_t> devs;
                 if (!params.devices.empty()) {
-                    // explicit device list: llama appends the local CPU for expert splits
                     for (auto * dev : params.devices) {
                         if (dev != nullptr) {
-                            count_pools(dev);
+                            devs.push_back(dev);
                         }
                     }
-                    n_cpu_pool++;
                 } else {
                     ggml_backend_load_all();
                     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                        count_pools(ggml_backend_dev_get(i));
+                        auto * dev = ggml_backend_dev_get(i);
+                        // same skip rule as the meta device: only the local CPU is excluded here - RPC
+                        // CPU servers have their own buffer type and stay in the list
+                        if (ggml_backend_dev_buffer_type(dev) == ggml_backend_cpu_buffer_type()) {
+                            continue;
+                        }
+                        devs.push_back(dev);
                     }
                 }
-                size_t n_plain_entries  = 0;
-                size_t n_expert_entries = 0;
-                for (size_t i = 0; i < split_arg.size(); ++i) {
-                    const std::string & part = split_arg[i];
-                    const bool is_expert = !part.empty() && (part.back() == 'e' || part.back() == 'E');
-                    n_expert_entries += is_expert ? 1 : 0;
-                    n_plain_entries  += is_expert ? 0 : 1;
-                    // entries are positional: first the GPU devices, then the CPU (expert) devices
-                    if (i <  n_gpu_pool &&  is_expert) {
-                        throw std::invalid_argument(string_format(
-                                "tensor split entry %zu ('%s') is an expert ('e') entry, but GPU device %zu expects a plain entry", i + 1, part.c_str(), i + 1));
-                    }
-                    if (i >= n_gpu_pool && !is_expert) {
-                        throw std::invalid_argument(string_format(
-                                "tensor split entry %zu ('%s') is a plain GPU entry, but CPU device %zu expects an expert ('e') entry", i + 1, part.c_str(), i + 1 - n_gpu_pool));
-                    }
+                ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (cpu_dev != nullptr && std::find(devs.begin(), devs.end(), cpu_dev) == devs.end()) {
+                    // the local CPU is always part of an expert split (use 0e to leave it empty)
+                    devs.push_back(cpu_dev);
                 }
-                if (n_plain_entries != n_gpu_pool) {
+                if (split_arg.size() != devs.size()) {
                     throw std::invalid_argument(string_format(
-                            "tensor split has %zu plain (GPU) entries, but %zu GPU devices are available",
-                            n_plain_entries, n_gpu_pool));
+                            "tensor split has %zu entries, but %zu devices take part in the split; "
+                            "pass --rpc/-dev before -ts, use 0e to disable a slot",
+                            split_arg.size(), devs.size()));
                 }
-                if (n_expert_entries != n_cpu_pool) {
-                    throw std::invalid_argument(string_format(
-                            "tensor split has %zu expert ('e') entries, but %zu CPU devices are available "
-                            "(local CPU plus CPU-type RPC servers registered so far; pass --rpc before -ts, use 0e to disable a slot)",
-                            n_expert_entries, n_cpu_pool));
-                }
-                // the buffer-override based MoE offloading mixes concepts with the grouped split;
+                // the buffer-override based MoE offloading mixes concepts with the split entries;
                 // --n-cpu-moe/-ncmoe (which normally works through such overrides) is the one
                 // exception - with expert split entries it is re-interpreted as the number of
-                // layers whose experts stay on the plain (GPU) devices, handled inside the meta
+                // layers whose experts stay on the 'e' entries, handled inside the meta
                 // device split. its per-layer overrides are dropped here; -cmoe and expert -ot
                 // rules (identifiable as non-matching patterns) remain an error
                 if (params.n_cpu_moe > 0 && !params.tensor_buft_overrides.empty()) {

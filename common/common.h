@@ -465,7 +465,7 @@ struct common_params {
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
-    int32_t n_cpu_moe          = -1;    // -1 is unset; with -sm tensor + expert '-ts e' entries: keep experts of the first N layers on the CPU ('e') entries, rest on the GPU (plain) entries
+    int32_t n_cpu_moe          = -1;    // -1 is unset; with -sm tensor + expert '-ts e' entries: keep experts of the first N layers on the 'e' entries, rest on the plain entries
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use

@@ -719,7 +719,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // expert ('e') entries only exist in tensor_split when the user asked for them;
         // n_cpu_moe keeps its usual meaning of "the first N layers' experts stay on CPU" -
         // layers [0, n_cpu_moe) split experts across the 'e' entries, the remaining layers
-        // across the plain (GPU) ones. both sides of the hand-off use the same telescoping
+        // across the plain ones. both sides of the hand-off use the same telescoping
         // carry below, so the boundary stays block-aligned automatically
         int32_t il_expert = -1;
         if (ud->has_expert && ud->n_cpu_moe > 0 && tensor_is_expert && tensor_name.compare(0, 4, "blk.") == 0) {

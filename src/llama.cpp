@@ -220,9 +220,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 devs.push_back(dev);
             }
             if (llama_model_has_expert_split(params)) {
-                // expert ('e') split entries target CPU devices by position - RPC CPU servers are already
-                // in the list (they have their own buffer type), append the local CPU last if missing;
-                // a trailing 0e entry disables it on the user's side
+                // expert ('e') split entries map positionally to the devices of this list, so append
+                // the local CPU last (it was skipped above by its CPU buffer type) unless already
+                // present; a trailing 0e entry disables it on the user's side
                 for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                     auto * dev = ggml_backend_dev_get(i);
                     if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU ||

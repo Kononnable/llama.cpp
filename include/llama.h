@@ -319,8 +319,8 @@ extern "C" {
         int32_t main_gpu;
 
         // with split_mode == LLAMA_SPLIT_MODE_TENSOR and expert ('e'-marked) tensor_split entries:
-        // layers [0, n_cpu_moe) keep their expert (MoE) weights on the CPU ('e') entries, the
-        // remaining layers split expert weights across the plain (GPU) entries. 0 = all expert
+        // layers [0, n_cpu_moe) keep their expert (MoE) weights on the 'e' entries, the
+        // remaining layers split expert weights across the plain entries. 0 = all expert
         // weights follow the 'e' entries; has no effect without expert tensor_split entries.
         int32_t n_cpu_moe;
 

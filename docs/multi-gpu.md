@@ -95,26 +95,29 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 #### Expert (MoE) tensor split with `-ts ...e`
 
 For MoE models you can mark entries in `--tensor-split` with the `e` suffix to send that device's
-share of the *expert* weights to it, while non-expert layers go only to the unmarked (GPU) devices:
+share of the *expert* weights to it, while non-expert layers go only to the unmarked (plain) devices:
 
 ```bash
 llama-cli -m moe-model.gguf -sm tensor -ts 1,2,2e,3e
 ```
 
-Here devices 0 and 1 (GPUs) split non-expert weights in a 1:2 ratio; devices 2 and 3 (CPUs,
-often remote via `--rpc`) split expert weights in a 2:3 ratio. Notes:
+Here devices 0 and 1 split non-expert weights in a 1:2 ratio; devices 2 and 3 split expert weights in a
+2:3 ratio. Notes:
 
 - Requires a MoE model and `-sm tensor`; using `e` with a dense model or a different split mode is an error.
 - Cannot be combined with `-cmoe` or `-ot` expert overrides.
-- With `-ncmoe N` the expert weights of the first `N` layers are restricted to the `e` (CPU)
-  entries, while the remaining layers' experts are split across the plain (GPU) entries -
-  a per-layer blend between expert-on-CPU and expert-on-GPU. The buffer-override behavior
-  of `-ncmoe` is suppressed in this combination: no extra CPU copies are kept and the meta
-  device keeps each expert tensor in one contiguous slice per device.
-- The entry count must match the devices: one plain entry per GPU-type device, then one `e` entry per
-  CPU-type device. The CPU pool is every CPU-type `--rpc` server plus the local CPU, which is always
-  added (also with an explicit `-dev` list) and sits last in the order. Pass `0e` for a CPU slot you
-  want to leave empty, e.g. `-ts 1,2,2e,3e,0e` disables the local CPU for two RPC expert devices.
+- Each entry maps positionally to one device of the split, and every device independently takes a plain
+  or `e` entry - so expert parts can be assigned to any device, including RPC GPU servers. For example,
+  `-ts 1,2e,0e` on a local GPU + RPC GPU + local CPU setup keeps non-expert weights on the local GPU and
+  sends the expert weights to the RPC GPU (0e disables the local CPU slot).
+- With `-ncmoe N` the expert weights of the first `N` layers are restricted to the `e` entries, while the
+  remaining layers' experts are split across the plain entries - a per-layer blend between the two share
+  sets. The buffer-override behavior of `-ncmoe` is suppressed in this combination: no extra CPU copies
+  are kept and the meta device keeps each expert tensor in one contiguous slice per device.
+- The device order is: all devices except the local CPU in registration order (typically the local GPUs,
+  then the `--rpc` servers in the order given), with the local CPU appended last - it is always part of
+  an expert split, also with an explicit `-dev` list. There must be one entry per device; pass `0e` for a
+  slot you want to leave empty, e.g. `-ts 1,2,2e,3e,0e` disables the local CPU for two RPC expert devices.
 - Options parse left-to-right: pass `--rpc` (and `-sm tensor`, and `-dev` if used) before `-ts`,
   otherwise the RPC servers are not yet visible to the count check.
 
