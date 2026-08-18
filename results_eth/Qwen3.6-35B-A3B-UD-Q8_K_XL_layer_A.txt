@@ -1,0 +1,290 @@
+0.00.030.143 I llama_completion: llama backend init
+0.00.030.153 I llama_completion: load the model and apply lora adapter, if any
+0.00.460.664 W model has unused tensor blk.40.attn_norm.weight (size = 8192 bytes) -- ignoring
+0.00.460.671 W model has unused tensor blk.40.post_attention_norm.weight (size = 8192 bytes) -- ignoring
+0.00.460.680 W model has unused tensor blk.40.attn_q.weight (size = 17825792 bytes) -- ignoring
+0.00.460.683 W model has unused tensor blk.40.attn_k.weight (size = 1114112 bytes) -- ignoring
+0.00.460.687 W model has unused tensor blk.40.attn_v.weight (size = 1114112 bytes) -- ignoring
+0.00.460.698 W model has unused tensor blk.40.attn_output.weight (size = 8912896 bytes) -- ignoring
+0.00.460.703 W model has unused tensor blk.40.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.460.706 W model has unused tensor blk.40.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.460.710 W model has unused tensor blk.40.ffn_gate_inp.weight (size = 1048576 bytes) -- ignoring
+0.00.460.713 W model has unused tensor blk.40.ffn_down_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.460.720 W model has unused tensor blk.40.ffn_gate_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.460.725 W model has unused tensor blk.40.ffn_up_exps.weight (size = 285212672 bytes) -- ignoring
+0.00.460.729 W model has unused tensor blk.40.ffn_gate_inp_shexp.weight (size = 4096 bytes) -- ignoring
+0.00.460.732 W model has unused tensor blk.40.ffn_gate_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.460.736 W model has unused tensor blk.40.ffn_up_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.460.740 W model has unused tensor blk.40.ffn_down_shexp.weight (size = 1114112 bytes) -- ignoring
+0.00.460.747 W model has unused tensor blk.40.nextn.eh_proj.weight (size = 8912896 bytes) -- ignoring
+0.00.460.751 W model has unused tensor blk.40.nextn.enorm.weight (size = 8192 bytes) -- ignoring
+0.00.460.755 W model has unused tensor blk.40.nextn.hnorm.weight (size = 8192 bytes) -- ignoring
+0.00.460.766 W model has unused tensor blk.40.nextn.shared_head_norm.weight (size = 8192 bytes) -- ignoring
+3.49.312.285 I llama_completion: llama threadpool init, n_threads = 8
+3.49.312.301 I 
+3.49.312.362 I system_info: n_threads = 8 (n_threads_batch = 8) / 16 | ROCm : NO_VMM = 1 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+3.49.312.363 I 
+3.49.315.824 I sampler seed: 466805893
+3.49.315.835 I sampler params: 
+	repeat_last_n = 64, repeat_penalty = 1.000, frequency_penalty = 0.000, presence_penalty = 0.000
+	dry_multiplier = 0.000, dry_base = 1.750, dry_allowed_length = 2, dry_penalty_last_n = 64
+	top_k = 20, top_p = 0.950, min_p = 0.050, xtc_probability = 0.000, xtc_threshold = 0.100, typical_p = 1.000, top_n_sigma = -1.000, temp = 1.000
+	mirostat = 0, mirostat_lr = 0.100, mirostat_ent = 5.000, adaptive_target = -1.000, adaptive_decay = 0.900
+3.49.315.840 I sampler chain: logits -> ?penalties -> ?dry -> ?top-n-sigma -> top-k -> ?typical -> top-p -> min-p -> ?xtc -> ?temp-ext -> dist 
+3.49.315.842 I generate: n_ctx = 7168, n_batch = 2048, n_predict = 1000, n_keep = 0
+3.49.315.842 I 
+Please analyze the following code and provide a summary of its functionality, potential bugs, and performance bottlenecks.
+
+[CODE START]
+// SPDX-License-Identifier: MIT
+#include <vector>
+#include <unordered_map>
+#include <string>
+#include <iostream>
+#include <memory>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+#include <mutex>
+
+class EventBus {
+private:
+    struct Handler {
+        int id;
+        std::function<void(const std::string&)> callback;
+        int priority;
+    };
+
+    std::unordered_map<std::string, std::vector<Handler>> subscribers;
+    std::mutex mtx;
+    int nextId = 0;
+    bool running = true;
+    std::vector<std::thread> workers;
+    std::vector<std::pair<std::string, std::string>> pendingEvents;
+
+    void processEvents() {
+        while (running) {
+            std::vector<std::pair<std::string, std::string>> localEvents;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                localEvents.swap(pendingEvents);
+            }
+            
+            if (localEvents.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            
+            for (const auto& [eventType, payload] : localEvents) {
+                auto it = subscribers.find(eventType);
+                if (it != subscribers.end()) {
+                    auto handlers = it->second;
+                    std::sort(handlers.begin(), handlers.end(), 
+                        [](const Handler& a, const Handler& b) {
+                            return a.priority > b.priority;
+                        });
+                    for (const auto& handler : handlers) {
+                        handler.callback(payload);
+                    }
+                }
+            }
+        }
+    }
+
+public:
+    EventBus(int numWorkers = 4) {
+        for (int i = 0; i < numWorkers; ++i) {
+            workers.emplace_back(&EventBus::processEvents, this);
+        }
+    }
+    
+    ~EventBus() {
+        running = false;
+        for (auto& worker : workers) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+    
+    int subscribe(const std::string& eventType, 
+                  std::function<void(const std::string&)> callback,
+                  int priority = 0) {
+        std::lock_guard<std::mutex> lock(mtx);
+        int id = nextId++;
+        subscribers[eventType].push_back({id, callback, priority});
+        return id;
+    }
+    
+    void unsubscribe(const std::string& eventType, int id) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = subscribers.find(eventType);
+        if (it != subscribers.end()) {
+            auto& handlers = it->second;
+            handlers.erase(std::remove_if(handlers.begin(), handlers.end(),
+                [id](const Handler& h) { return h.id == id; }),
+                handlers.end());
+        }
+    }
+    
+    void emit(const std::string& eventType, const std::string& payload) {
+        std::lock_guard<std::mutex> lock(mtx);
+        pendingEvents.emplace_back(eventType, payload);
+    }
+    
+    size_t getPendingCount() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return pendingEvents.size();
+    }
+};
+
+class DataProcessor {
+private:
+    std::vector<int> data;
+    mutable std::mutex dataMutex;
+    EventBus& bus;
+    int eventCounter = 0;
+    
+public:
+    DataProcessor(EventBus& eventBus) : bus(eventBus) {
+        bus.subscribe("data.input", [this](const std::string& payload) {
+            std::lock_guard<std::mutex> lock(dataMutex);
+            int value = std::stoi(payload);
+            data.push_back(value);
+            eventCounter++;
+            bus.emit("data.processed", std::to_string(value * 2));
+        }, 10);
+        
+        bus.subscribe("data.clear", [this](const std::string&) {
+            std::lock_guard<std::mutex> lock(dataMutex);
+            data.clear();
+            bus.emit("data.cleared", "All data removed");
+        });
+    }
+    
+    std::vector<int> getData() const {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        return data;
+    }
+    
+    double calculateAverage() const {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        if (data.empty()) return 0.0;
+        long long sum = 0;
+        for (int val : data) {
+            sum += val;
+        }
+        return static_cast<double>(sum) / data.size();
+    }
+    
+    int getEventCount() const { return eventCounter; }
+};
+
+class MetricsCollector {
+private:
+    struct Metric {
+        std::string name;
+        double value;
+        std::chrono::system_clock::time_point timestamp;
+    };
+    std::vector<Metric> metrics;
+    mutable std::mutex mtx;
+    
+public:
+    void record(const std::string& name, double value) {
+        std::lock_guard<std::mutex> lock(mtx);
+        metrics.push_back({name, value, std::chrono::system_clock::now()});
+    }
+    
+    void printSummary() const {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::unordered_map<std::string, double> averages;
+        std::unordered_map<std::string, int> counts;
+        
+        for (const auto& m : metrics) {
+            averages[m.name] += m.value;
+            counts[m.name]++;
+        }
+        
+        for (auto& [name, total] : averages) {
+            std::cout << name << ": " << (total / counts[name]) << std::endl;
+        }
+    }
+};
+
+int main() {
+    EventBus bus(2);
+    DataProcessor processor(bus);
+    MetricsCollector metrics;
+    
+    bus.subscribe("data.processed", [&metrics](const std::string& payload) {
+        metrics.record("latency", std::stod(payload) * 0.5);
+    });
+    
+    // Simulate workload
+    for (int i = 0; i < 100; ++i) {
+        bus.emit("data.input", std::to_string(i * 10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    std::cout << "Average: " << processor.calculateAverage() << std::endl;
+    std::cout << "Events processed: " << processor.getEventCount() << std::endl;
+    metrics.printSummary();
+    
+    return 0;
+}
+[CODE END]
+
+Please provide:
+1. A high-level summary of what this system does
+2. At least 3 potential bugs or issues you identify
+3. At least 2 performance bottlenecks
+4. Suggestions for improvement
+
+<think>
+
+</think>
+
+Here is the analysis of the provided C++ code.
+
+### 1. High-Level Summary
+
+This code implements a basic **Event-Driven Architecture** with a multi-threaded event loop.
+- **`EventBus`**: Acts as a central message broker. It supports subscribing to event types with priorities, emitting events asynchronously, and dispatching them to registered handlers. It uses a producer-consumer pattern where multiple worker threads process a shared queue of pending events.
+- **`DataProcessor`**: A consumer that listens for `data.input` events. It parses the payload, stores integers in a vector, and emits `data.processed` events with a transformed value (doubled). It also handles `data.clear` events.
+- **`MetricsCollector`**: A helper class to record and print summary statistics for specific metrics.
+- **`main`**: Orchestrates the system by emitting 100 integer inputs, sleeping briefly to allow processing, and then printing the final state of the data processor and metrics.
+
+---
+
+### 2. Potential Bugs and Issues
+
+#### Bug 1: Undefined Behavior in `MetricsCollector::printSummary`
+In the `printSummary` method, the code uses `auto& [name, total] : averages`. However, `averages` is a `std::unordered_map<std::string, double>`. The structured binding assigns `total` as a reference to the value in the map. Later, `total / counts[name]` is calculated.
+While this specific part isn't strictly UB, the logic is flawed because `averages` is populated but `counts` is a separate map. More critically, if `counts[name]` is not found (which shouldn't happen here since they are populated in the same loop), it would default construct `0`, leading to division by zero.
+**However, the real bug is here:** `std::unordered_map` does not guarantee order. While the output order doesn't matter for correctness, the logic `total / counts[name]` assumes `counts[name]` exists. If for some reason the maps got out of sync (not possible here in current code, but fragile design), it would crash.
+**Critical Bug:** Actually, looking closer at `MetricsCollector::record`, there is no issue. But in `printSummary`, `averages[m.name] += m.value` and `counts[m.name]++` are correct.
+**Wait, let's look for a real UB.**
+In `DataProcessor` destructor: The `DataProcessor` is a local variable in `main`. When `main` returns, `DataProcessor` is destroyed. Its destructor calls `bus.unsubscribe`? No, it doesn't have a destructor.
+**Real Bug 1: Memory Leak / Dangling Reference in Subscriptions.**
+The `EventBus` stores `std::function<void(const std::string&)>`. In `DataProcessor` constructor, it subscribes using lambdas that capture `this`. If the `EventBus` outlives the `DataProcessor` (e.g., if `DataProcessor` was dynamically allocated and deleted, or if the scope ended), the `std::function` would hold a dangling pointer. In this specific `main`, `DataProcessor` is destroyed *before* `EventBus` (stack unwinding order is reverse of declaration). `processor` is declared before `metrics`, but `bus` is declared first.
+Declaration order in `main`: `EventBus bus`, `DataProcessor processor`, `MetricsCollector metrics`.
+Destruction order: `metrics`, `processor`, `bus`.
+So `DataProcessor` is destroyed while `EventBus` is still alive. The `EventBus` still holds lambdas capturing `this` (pointer to `DataProcessor`). If `EventBus` tries to emit an event *after* `DataProcessor` is destroyed but *before* `EventBus` is destroyed, it will call a method on a destroyed object.
+In `main`, the loop finishes, then it sleeps. If an event is emitted during that sleep or after `DataProcessor` destruction, it's UB. However, the loop emits `data.input`. The `DataProcessor` handles it. No other emitter exists. So this is technically safe *in this specific run*, but it's a **design flaw**: `EventBus` does not provide weak references or notification when subscribers are destroyed. If you move `DataProcessor` to dynamic allocation and delete it, `EventBus` will crash on subsequent emits.
+
+#### Bug 2: Race Condition in `EventBus::processEvents` with `subscribers`
+In `processEvents`, the code does:
+```cpp
+auto it = subscribers.find(eventType);
+if (it != subscribers.end()) {
+    auto handlers
+
+5.14.760.799 I common_perf_print:    sampling time =     353.57 ms
+5.14.760.802 I common_perf_print:    samplers time =     138.18 ms /  2605 tokens
+5.14.760.803 I common_perf_print:        load time =  229133.88 ms
+5.14.760.805 I common_perf_print: prompt eval time =   17756.40 ms /  1605 tokens (   11.06 ms per token,    90.39 tokens per second)
+5.14.760.806 I common_perf_print:        eval time =   67309.98 ms /   999 runs   (   67.38 ms per token,    14.84 tokens per second)
+5.14.760.808 I common_perf_print:       total time =   85448.52 ms /  2604 tokens
+5.14.760.809 I common_perf_print: unaccounted time =      28.58 ms /   0.0 %      (total - sampling - prompt eval - eval) / (total)
+5.14.760.810 I common_perf_print:    graphs reused =        994
