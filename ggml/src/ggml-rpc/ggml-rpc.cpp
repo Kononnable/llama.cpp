@@ -2,10 +2,12 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "transport.h"
 
 #include <array>
 #include <cinttypes>
+#include <cstdlib>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,6 +25,62 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
+// RPC perf debug (GGML_RPC_PERF)
+//   GGML_RPC_PERF=0  report every request
+//   GGML_RPC_PERF=N  report every N seconds (aggregating)
+// unset: disabled
+//
+// server: time spent in the graph compute handlers (the true remote compute time)
+// client: time spent blocked waiting for the server (network round trips + straggle)
+static int rpc_perf_interval() {
+    static const int interval = []() {
+        const char * s = std::getenv("GGML_RPC_PERF");
+        if (s == nullptr || s[0] == '\0') {
+            return -1;
+        }
+        return std::atoi(s);
+    }();
+    return interval;
+}
+
+struct rpc_perf_data {
+    int64_t compute_us = 0;
+    int64_t loop_us    = 0;
+    int64_t n          = 0;
+};
+
+static std::mutex    rpc_perf_mutex;
+static rpc_perf_data rpc_perf_server;
+static rpc_perf_data rpc_perf_client;
+static int64_t       rpc_perf_t_last_report = ggml_time_us();
+
+static void rpc_perf_report() {
+    const int interval = rpc_perf_interval();
+    const int64_t t_now = ggml_time_us();
+
+    if (interval != 0 && (t_now - rpc_perf_t_last_report) < interval*1000000LL) {
+        return;
+    }
+
+    if (rpc_perf_server.n > 0) {
+        GGML_LOG_INFO("[rpc-perf] server: %lld graphs | compute=%8.2f ms | loop=%8.2f ms | overhead=%8.2f ms (%6.2f ms/req)\n",
+                (long long) rpc_perf_server.n,
+                1e-3*rpc_perf_server.compute_us,
+                1e-3*rpc_perf_server.loop_us,
+                1e-3*(rpc_perf_server.loop_us - rpc_perf_server.compute_us),
+                1e-3*(rpc_perf_server.loop_us - rpc_perf_server.compute_us)/rpc_perf_server.n);
+    }
+    if (rpc_perf_client.n > 0) {
+        GGML_LOG_INFO("[rpc-perf] client: %lld req | wait=%8.2f ms | avg=%6.2f ms/req\n",
+                (long long) rpc_perf_client.n,
+                1e-3*rpc_perf_client.compute_us,
+                1e-3*rpc_perf_client.compute_us/rpc_perf_client.n);
+    }
+
+    rpc_perf_server = {};
+    rpc_perf_client = {};
+    rpc_perf_t_last_report = t_now;
+}
 
 namespace fs = std::filesystem;
 
@@ -370,6 +428,8 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
+    const bool do_perf = rpc_perf_interval() >= 0;
+    const int64_t t_start = do_perf ? ggml_time_us() : 0;
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
         return false;
@@ -379,6 +439,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     }
     if (!sock->recv_data(output, output_size)) {
         return false;
+    }
+    if (do_perf) {
+        std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+        rpc_perf_client.compute_us += ggml_time_us() - t_start;
+        rpc_perf_client.n++;
+        rpc_perf_report();
     }
     return true;
 }
@@ -1702,6 +1768,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    const int64_t t_total_start = ggml_time_us();
     // serialization format:
     // | device (4 bytes) | uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -1775,9 +1842,35 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }
+    const int64_t t_compute_start = ggml_time_us();
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     sg.graph = graph;
+
+    if (RPC_DEBUG) {
+        // dump the rebuilt graph: op sequence, compute flags, last node name
+        char line[4096];
+        int off = 0;
+        off += snprintf(line + off, sizeof(line) - off, "[rpc-graph] device=%u uid=%llu n_nodes=%d last=%s:",
+                device, (unsigned long long) uid, graph->n_nodes,
+                graph->n_nodes > 0 ? graph->nodes[graph->n_nodes - 1]->name : "?");
+        for (int i = 0; i < graph->n_nodes && off < (int) sizeof(line) - 256; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            off += snprintf(line + off, sizeof(line) - off, " %s%s",
+                    ggml_op_name(node->op),
+                    (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "*" : "-");
+        }
+        GGML_LOG_DEBUG("%s\n", line);
+    }
+
+    if (rpc_perf_interval() >= 0) {
+        const int64_t t_end = ggml_time_us();
+        LOG_DBG("[%s] device: %u, uid: %" PRIu64 ", n_nodes: %u, compute: %.2f ms, total: %.2f ms\n",
+                __func__, device, uid, n_nodes, 1e-3*(t_end - t_compute_start), 1e-3*(t_end - t_total_start));
+        std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+        rpc_perf_server.compute_us += t_end - t_compute_start;
+        rpc_perf_server.n++;
+    }
     return true;
 }
 
@@ -1793,8 +1886,31 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = it->second.graph;
     LOG_DBG("[%s] device: %u, uid: %" PRIu64 "\n", __func__, device, request.uid);
+
+    if (RPC_DEBUG) {
+        // dump the cached graph: op sequence, compute flags, last node name
+        char line[4096];
+        int off = 0;
+        off += snprintf(line + off, sizeof(line) - off, "[rpc-graph] device=%u uid=%llu n_nodes=%d last=%s:",
+                device, (unsigned long long) request.uid, graph->n_nodes,
+                graph->n_nodes > 0 ? graph->nodes[graph->n_nodes - 1]->name : "?");
+        for (int i = 0; i < graph->n_nodes && off < (int) sizeof(line) - 256; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            off += snprintf(line + off, sizeof(line) - off, " %s%s",
+                    ggml_op_name(node->op),
+                    (node->flags & GGML_TENSOR_FLAG_COMPUTE) ? "*" : "-");
+        }
+        GGML_LOG_DEBUG("%s\n", line);
+    }
+    const int64_t t_compute_start = ggml_time_us();
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+
+    if (rpc_perf_interval() >= 0) {
+        std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+        rpc_perf_server.compute_us += ggml_time_us() - t_compute_start;
+        rpc_perf_server.n++;
+    }
     return true;
 }
 
@@ -1910,6 +2026,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
             break;
         }
+        const int64_t t_cmd_start = rpc_perf_interval() >= 0 ? ggml_time_us() : 0;
         switch (cmd) {
             case RPC_CMD_HELLO: {
                 // HELLO command is handled above
@@ -2132,6 +2249,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
+                if (rpc_perf_interval() >= 0) {
+                    std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+                    rpc_perf_server.loop_us += ggml_time_us() - t_cmd_start;
+                    rpc_perf_report();
+                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -2141,6 +2263,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 if (!server.graph_recompute(request)) {
                     return;
+                }
+                if (rpc_perf_interval() >= 0) {
+                    std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+                    rpc_perf_server.loop_us += ggml_time_us() - t_cmd_start;
+                    rpc_perf_report();
                 }
                 break;
             }
@@ -2195,7 +2322,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 
 void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+                                   size_t n_threads, uint32_t poll, size_t n_devices, ggml_backend_dev_t * devices) {
     if (n_devices == 0 || devices == nullptr) {
         GGML_LOG_ERROR("%s: invalid arguments to ggml_backend_rpc_start_server\n", __func__);
         return;
@@ -2209,6 +2336,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     GGML_LOG_INFO("  endpoint       : %s\n", endpoint);
     GGML_LOG_INFO("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
     GGML_LOG_INFO("Devices:\n");
+    std::vector<ggml_threadpool_t> threadpools;
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
         size_t free, total;
@@ -2226,6 +2354,21 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
             auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
             if (ggml_backend_set_n_threads_fn) {
                 ggml_backend_set_n_threads_fn(backend, n_threads);
+            }
+            // attach a persistent threadpool so graph computes don't spawn a disposable
+            // threadpool (thread create/join) per request; also keeps threads hot between
+            // requests when poll is high
+            auto * threadpool_new_fn      = (decltype(ggml_threadpool_new)           *) ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new");
+            auto * set_threadpool_fn     = (decltype(ggml_backend_cpu_set_threadpool) *) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+            if (threadpool_new_fn && set_threadpool_fn) {
+                struct ggml_threadpool_params tpp = ggml_threadpool_params_default(n_threads);
+                tpp.poll = poll;
+                ggml_threadpool_t tp = threadpool_new_fn(&tpp);
+                if (tp) {
+                    set_threadpool_fn(backend, tp);
+                    threadpools.push_back(tp);
+                    GGML_LOG_INFO("  threadpool      : n_threads=%zu poll=%u\n", n_threads, poll);
+                }
             }
         }
     }
@@ -2261,6 +2404,9 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         GGML_LOG_INFO("%s: client connection closed\n", __func__);
     }
     rpc_transport_shutdown();
+    for (auto threadpool : threadpools) {
+        ggml_threadpool_free(threadpool);
+    }
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }

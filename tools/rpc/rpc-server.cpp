@@ -286,6 +286,7 @@ struct rpc_server_params {
     int                      port        = 50052;
     bool                     use_cache   = false;
     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+    int                      poll        = 50;
     int                      verbosity   = LOG_LEVEL_INFO;
     std::vector<std::string> devices;
 };
@@ -295,6 +296,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h, --help                       show this help message and exit\n");
     fprintf(stderr, "  -t, --threads N                  number of threads for the CPU device (default: %d)\n", params.n_threads);
+    fprintf(stderr, "  -poll, --poll N                  threadpool polling level 0-100 (default: %d)\n", params.poll);
     fprintf(stderr, "  -d, --device <dev1,dev2,...>     comma-separated list of devices\n");
     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
@@ -319,6 +321,15 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params & 
             params.n_threads = std::stoi(argv[i]);
             if (params.n_threads <= 0) {
                 RPC_ERR("error: invalid number of threads: %d\n", params.n_threads);
+                return false;
+            }
+        } else if (arg == "-poll" || arg == "--poll") {
+            if (++i >= argc) {
+                return false;
+            }
+            params.poll = std::stoi(argv[i]);
+            if (params.poll < 0 || params.poll > 100) {
+                RPC_ERR("error: invalid poll level: %d\n", params.poll);
                 return false;
             }
         } else if (arg == "-d" || arg == "--device") {
@@ -461,6 +472,6 @@ int main(int argc, char * argv[]) {
         return 1;
     }
 
-    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data());
+    start_server_fn(endpoint.c_str(), cache_dir, params.n_threads, params.poll, devices.size(), devices.data());
     return 0;
 }

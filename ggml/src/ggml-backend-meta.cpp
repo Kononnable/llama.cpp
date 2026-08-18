@@ -1824,8 +1824,11 @@ static void ggml_meta_perf_report() {
     char line[1024];
     int off = 0;
     for (const auto & it : ggml_meta_perf_compute_accum) {
-        off += snprintf(line + off, sizeof(line) - off, " | %-10s compute=%7.2fms",
-            ggml_backend_name(it.first), 1e-3*it.second);
+        // RPC backends cannot be synchronized: "compute" only measures the client-side graph send time,
+        // the remote time is logged by the RPC server (GGML_RPC_PERF)
+        const char * tag = ggml_backend_is_rpc(it.first) ? "[send]" : "";
+        off += snprintf(line + off, sizeof(line) - off, " | %-10s%s compute=%7.2fms",
+            ggml_backend_name(it.first), tag, 1e-3*it.second);
         if (off >= (int) sizeof(line) - 128) {
             break;
         }

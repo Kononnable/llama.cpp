@@ -170,7 +170,11 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
+    // debug: split the per-graph time into plan vs node compute (GGML_CPU_DEBUG_TIMING)
+    static const bool dbg_timing = getenv("GGML_CPU_DEBUG_TIMING") != NULL;
+    const int64_t t0 = dbg_timing ? ggml_time_us() : 0;
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
+    const int64_t t1 = dbg_timing ? ggml_time_us() : 0;
 
     if (cpu_ctx->work_size < cplan.work_size) {
         delete[] cpu_ctx->work_data;
@@ -186,8 +190,17 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    const int64_t t2 = dbg_timing ? ggml_time_us() : 0;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    ggml_graph_compute(cgraph, &cplan);
+
+    if (dbg_timing) {
+        GGML_LOG_INFO("[cpu-graph] uid=%llu n_nodes=%d plan=%.3fms compute=%.3fms total=%.3fms\n",
+                (unsigned long long) cgraph->uid, cgraph->n_nodes,
+                1e-3*(t1 - t0), 1e-3*(ggml_time_us() - t2), 1e-3*(ggml_time_us() - t0));
+    }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {

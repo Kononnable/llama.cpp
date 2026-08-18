@@ -3064,6 +3064,23 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
 
+    // per-op timing debug (GGML_PERF_OP=N: print every N graphs, default 1 when set)
+    // measured on thread 0 only
+    static int perf_op_init = -1;
+    static int perf_op_interval;
+    if (perf_op_init < 0) {
+        const char * s = getenv("GGML_PERF_OP");
+        perf_op_init   = s != NULL;
+        perf_op_interval = s == NULL || s[0] == '\0' ? 1 : atoi(s);
+        if (perf_op_interval < 1) {
+            perf_op_interval = 1;
+        }
+    }
+    static int64_t perf_op_t[GGML_OP_COUNT];
+    static int     perf_op_n[GGML_OP_COUNT];
+    static int     perf_op_graphs;
+    const bool perf_op = perf_op_init && state->ith == 0;
+
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
 #else
@@ -3097,6 +3114,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        const int64_t t_node_start = perf_op ? ggml_time_us() : 0;
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3115,6 +3134,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+
+        if (perf_op) {
+            perf_op_t[node->op] += ggml_time_us() - t_node_start;
+            perf_op_n[node->op]++;
+        }
     }
 
 #ifdef GGML_USE_OPENMP
@@ -3124,6 +3148,27 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (perf_op) {
+        perf_op_graphs++;
+        if (perf_op_graphs % perf_op_interval == 0) {
+            char line[2048];
+            int off = 0;
+            off += snprintf(line + off, sizeof(line) - off,
+                    "[op-perf] graph uid=%llu n_nodes=%d:",
+                    (unsigned long long) cgraph->uid, cgraph->n_nodes);
+            for (int i = 0; i < GGML_OP_COUNT && off < (int) sizeof(line) - 128; i++) {
+                if (perf_op_n[i] > 0) {
+                    off += snprintf(line + off, sizeof(line) - off,
+                            " %s: %7.2f ms (%d)",
+                            ggml_op_name(i), 1e-3*perf_op_t[i], perf_op_n[i]);
+                }
+            }
+            GGML_LOG_INFO("%s\n", line);
+            memset(perf_op_t, 0, sizeof(perf_op_t));
+            memset(perf_op_n, 0, sizeof(perf_op_n));
+        }
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
