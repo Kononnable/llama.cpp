@@ -93,7 +93,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+        create_tensor_exps(layer, il, LLM_TENSOR_FFN_DOWN_EXPS, { n_ff_exp, n_embd, n_expert }, layer.ffn_down_exps_shards, &layer.ffn_down_exps, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
 
         // Shared experts
@@ -120,7 +120,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, mtp_flags);
+        create_tensor_exps(layer, il, LLM_TENSOR_FFN_DOWN_EXPS, { n_ff_exp, n_embd, n_expert }, layer.ffn_down_exps_shards, &layer.ffn_down_exps, mtp_flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, mtp_flags);
 
         // Shared experts
@@ -495,21 +495,38 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+    const auto & layer = model.layers[il];
+
+    ggml_tensor * moe_out = model.n_expert_devices() > 0
+        ? build_moe_ffn_sharded(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps_shards,
+            layer.ffn_gate_exps_shards,
+            layer.ffn_down_exps_shards,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            nullptr, layer.ffn_gate_up_exps_shards,
+            layer.ffn_up_exps_s,
+            layer.ffn_gate_exps_s,
+            layer.ffn_down_exps_s,
+            (int) model.n_expert_devices())
+        : build_moe_ffn(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps,
+            layer.ffn_gate_exps,
+            layer.ffn_down_exps,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, layer.ffn_gate_up_exps,
+            layer.ffn_up_exps_s,
+            layer.ffn_gate_exps_s,
+            layer.ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
 
     // Add shared experts if present - following Qwen3Next reference implementation
@@ -675,8 +692,23 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_attn_post_norm", il);
 
     // MoE FFN — routed experts plus gated shared expert (mirrors qwen35moe).
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
+    ggml_tensor * moe_out = model.n_expert_devices() > 0
+        ? build_moe_ffn_sharded(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps_shards,
+            layer.ffn_gate_exps_shards,
+            layer.ffn_down_exps_shards,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, layer.ffn_gate_up_exps_shards,
+            layer.ffn_up_exps_s,
+            layer.ffn_gate_exps_s,
+            layer.ffn_down_exps_s,
+            (int) model.n_expert_devices())
+        : build_moe_ffn(cur,
             layer.ffn_gate_inp,
             layer.ffn_up_exps,
             layer.ffn_gate_exps,

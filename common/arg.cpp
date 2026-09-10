@@ -2852,6 +2852,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
     add_opt(common_arg(
+        {"-tse", "--tensor-split-experts"}, "N0,N1,N2,...",
+        "fraction of the expert feature width to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
+        [](common_params & params, const std::string & value) {
+            std::string arg_next = value;
+
+            // split string by , and /
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ arg_next.begin(), arg_next.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() >= llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                if (i < split_arg.size()) {
+                    params.tensor_split_experts[i] = std::stof(split_arg[i]);
+                } else {
+                    params.tensor_split_experts[i] = 0.0f;
+                }
+            }
+            if (!llama_supports_gpu_offload()) {
+                fprintf(stderr, "warning: llama.cpp was compiled without support for GPU offload. Setting a tensor split has no effect.\n");
+            }
+        }
+    ).set_env("LLAMA_ARG_TENSOR_SPLIT_EXPERTS"));
+    add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
         [](common_params & params, int value) {

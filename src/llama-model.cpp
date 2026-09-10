@@ -358,6 +358,9 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
         }
+        if (params.tensor_split_experts != nullptr && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP) {
+            throw std::runtime_error(std::string("tensor_split_experts not implemented for architecture '") + llm_arch_name(arch) + "'");
+        }
     }
 
     return model;
@@ -1219,6 +1222,14 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::vector<float> tensor_split_experts_owned;
+
+    // devices selected by tensor_split_experts, in shard order, and their fractions
+    std::vector<ggml_backend_dev_t> expert_devices;
+    std::vector<float>              expert_splits;
+
+    // expert shards that live in pinned host RAM instead of the device memory
+    std::vector<bool> expert_host_ram;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -1277,6 +1288,10 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.tensor_split_experts != nullptr) {
+        pimpl->tensor_split_experts_owned.assign(params.tensor_split_experts, params.tensor_split_experts + llama_max_devices());
+        this->params.tensor_split_experts = pimpl->tensor_split_experts_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -1544,6 +1559,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
     }
 
+    // select the devices that hold expert feature slices (tensor_split_experts)
+    pimpl->expert_devices.clear();
+    pimpl->expert_splits.clear();
+    if (params.tensor_split_experts != nullptr) {
+        if (params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+            throw std::runtime_error("tensor_split_experts requires LLAMA_SPLIT_MODE_LAYER");
+        }
+        for (size_t i = 0; i < devices.size(); ++i) {
+            if (params.tensor_split_experts[i] > 0.0f) {
+                pimpl->expert_devices.push_back(devices[i].dev);
+                pimpl->expert_splits.push_back(params.tensor_split_experts[i]);
+            }
+        }
+        if (pimpl->expert_devices.size() == 1) {
+            throw std::runtime_error("tensor_split_experts needs at least 2 devices with a nonzero share");
+        }
+    }
+
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
@@ -1608,6 +1641,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+
+    // an expert shard lives in host RAM when its device also holds dense weights and exposes a
+    // host buffer type, so that the dense weights can use the remaining device memory
+    pimpl->expert_host_ram.assign(pimpl->expert_devices.size(), false);
+    for (size_t j = 0; j < pimpl->expert_devices.size(); ++j) {
+        ggml_backend_dev_t dev = pimpl->expert_devices[j];
+        bool hosts_dense = pimpl->dev_output.dev == dev;
+        for (const auto & dl : pimpl->dev_layer) {
+            hosts_dense = hosts_dense || dl.dev == dev;
+        }
+        pimpl->expert_host_ram[j] = hosts_dense && ggml_backend_dev_host_buffer_type(dev) != nullptr;
+    }
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -1985,6 +2030,14 @@ size_t llama_model::n_devices() const {
 
 const float * llama_model::tensor_split() const {
     return params.tensor_split;
+}
+
+const float * llama_model::tensor_split_experts() const {
+    return params.tensor_split_experts;
+}
+
+size_t llama_model::n_expert_devices() const {
+    return pimpl->expert_devices.size();
 }
 
 uint32_t llama_model::n_gpu_layers() const {
@@ -2859,6 +2912,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.tensor_split_experts        =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
@@ -3318,6 +3372,115 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
     return create_tensor(*ml, tn, ne, flags);
 }
 
+void llama_model_base::create_tensor_exps(llama_layer & layer, int bid, llm_tensor tensor, const std::initializer_list<int64_t> & ne,
+        struct ggml_tensor ** shards, struct ggml_tensor ** single, int flags) {
+    const size_t n_shards = pimpl->expert_devices.size();
+
+    if (n_shards <= 1) {
+        *single = create_tensor(tn(tensor, "weight", bid), ne, flags);
+        return;
+    }
+
+    std::vector<int64_t> ne_v(ne.begin(), ne.end());
+    while (ne_v.size() < GGML_MAX_DIMS) {
+        ne_v.push_back(1);
+    }
+
+    int axis;
+    std::vector<llama_model_loader::shard_segment> segments;
+    switch (tensor) {
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+            axis = 1;
+            segments.push_back({ ne_v[1], 1 });
+            break;
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            axis = 1;
+            segments.push_back({ ne_v[1]/2, 2 });
+            break;
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+            // split the output axis (n_embd); splitting the quantized contraction axis (n_ff) would
+            // limit the granularity to whole blocks
+            axis = 1;
+            segments.push_back({ ne_v[1], 1 });
+            break;
+        default:
+            GGML_ABORT("create_tensor_exps: unsupported tensor %d", (int) tensor);
+    }
+
+    const LLM_TN_IMPL tn_impl = tn(tensor, "weight", bid);
+    const ggml_tensor * parent = ml->get_tensor_meta(tn_impl.str().c_str());
+    if (parent == nullptr) {
+        if (flags & llama_model_loader::TENSOR_NOT_REQUIRED) {
+            *single = nullptr;
+            return;
+        }
+        throw std::runtime_error(format("missing tensor '%s'", tn_impl.str().c_str()));
+    }
+
+    if (ml->get_tensor_meta(tn(tensor, "scale", bid).str().c_str()) != nullptr ||
+        ml->get_tensor_meta(tn(tensor, "input_scale", bid).str().c_str()) != nullptr) {
+        throw std::runtime_error(format("tensor '%s': expert scales are not supported with tensor_split_experts", tn_impl.str().c_str()));
+    }
+
+    const int64_t extent      = ne_v[axis];
+    // the split is on a non-quantized axis, so any granularity is valid; keep the block alignment only for safety
+    const int64_t granularity = axis == 0 ? std::lcm((int64_t) ggml_blck_size(parent->type), (int64_t) 128) : 1;
+
+    std::vector<int64_t> bounds(n_shards + 1, 0);
+    {
+        float sum = 0.0f;
+        std::vector<float> scan(n_shards);
+        for (size_t j = 0; j < n_shards; ++j) {
+            sum += pimpl->expert_splits[j];
+            scan[j] = sum;
+        }
+        int64_t low = 0;
+        for (size_t j = 0; j + 1 < n_shards; ++j) {
+            int64_t high = sum == 0.0f ? extent*(int64_t)(j + 1)/n_shards : (int64_t)(extent*scan[j]/scan.back());
+            high -= high % granularity;
+            // every shard needs at least one block, and every remaining shard too
+            const int64_t min_high = low + granularity;
+            int64_t max_high = extent - granularity*(int64_t)(n_shards - 1 - j);
+            max_high -= max_high % granularity;
+            if (min_high > max_high) {
+                throw std::runtime_error(format("tensor '%s': expert split too fine for %zu devices", tn_impl.str().c_str(), n_shards));
+            }
+            high = std::max(min_high, std::min(high, max_high));
+            bounds[j + 1] = high;
+            low = high;
+        }
+        bounds[n_shards] = extent;
+    }
+
+    for (size_t j = 0; j < n_shards; ++j) {
+        const int64_t low  = bounds[j];
+        const int64_t high = bounds[j + 1];
+        if (low == high) {
+            throw std::runtime_error(format("tensor '%s': expert share for device %zu is too small", tn_impl.str().c_str(), j));
+        }
+        const buft_list_t * buft_list = &pimpl->gpu_buft_list.at(pimpl->expert_devices[j]);
+        ggml_backend_buffer_type_t buft_forced = pimpl->expert_host_ram[j] ?
+            ggml_backend_dev_host_buffer_type(pimpl->expert_devices[j]) : nullptr;
+        shards[j] = ml->create_tensor_shard(hparams, &pimpl->cpu_buft_list, buft_list, buft_forced,
+                tn_impl, ne, axis, low, high, segments, (int) j);
+    }
+
+    {
+        std::string b;
+        for (size_t j = 0; j <= n_shards; ++j) {
+            b += format(" %d", (int) bounds[j]);
+        }
+        LLAMA_LOG_DEBUG("%s: %s axis %d, ne %d, bounds%s\n", __func__, tn_impl.str().c_str(), axis, (int) extent, b.c_str());
+    }
+    for (size_t j = 0; j < n_shards; ++j) {
+        LLAMA_LOG_DEBUG("%s: %s shard %zu on %s, %zu bytes\n", __func__, tn_impl.str().c_str(), j,
+                ggml_backend_dev_name(pimpl->expert_devices[j]), ggml_nbytes(shards[j]));
+    }
+
+    GGML_UNUSED(layer);
+}
+
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
     if (flags & TENSOR_SKIP) {
         const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
@@ -3325,6 +3488,19 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
         create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, skip | TENSOR_SKIP_IF_VIRTUAL);
         create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS,    "weight", bid), {n_embd_, n_ff_,     n_expert_}, skip);
         create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,      "weight", bid), {n_embd_, n_ff_,     n_expert_}, skip);
+        return;
+    }
+
+    if (!pimpl->expert_devices.empty()) {
+        if (ml->get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid).str().c_str()) != nullptr) {
+            create_tensor_exps(layer, bid, LLM_TENSOR_FFN_GATE_UP_EXPS,
+                    {n_embd_, n_ff_ * 2, n_expert_}, layer.ffn_gate_up_exps_shards, &layer.ffn_gate_up_exps, flags);
+        } else {
+            create_tensor_exps(layer, bid, LLM_TENSOR_FFN_GATE_EXPS,
+                    {n_embd_, n_ff_, n_expert_}, layer.ffn_gate_exps_shards, &layer.ffn_gate_exps, flags);
+            create_tensor_exps(layer, bid, LLM_TENSOR_FFN_UP_EXPS,
+                    {n_embd_, n_ff_, n_expert_}, layer.ffn_up_exps_shards, &layer.ffn_up_exps, flags);
+        }
         return;
     }
 

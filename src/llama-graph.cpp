@@ -2367,6 +2367,131 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
+ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
+         ggml_tensor * cur,
+         ggml_tensor * gate_inp,
+         ggml_tensor * const * up_exps,
+         ggml_tensor * const * gate_exps,
+         ggml_tensor * const * down_exps,
+         ggml_tensor * exp_probs_b,
+             int64_t   n_expert,
+             int64_t   n_expert_used,
+     llm_ffn_op_type   type_op,
+                bool   norm_w,
+               float   w_scale,
+        llama_expert_gating_func_type gating_op,
+                 int   il,
+         ggml_tensor * probs_in,
+         ggml_tensor * const * gate_up_exps,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s,
+                 int   n_shards) const {
+    GGML_ASSERT(n_shards > 0);
+    GGML_ASSERT(down_exps != nullptr);
+    GGML_ASSERT(gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX);
+    GGML_ASSERT(type_op == LLM_FFN_SILU);
+    GGML_ASSERT(probs_in == nullptr);
+    GGML_ASSERT(exp_probs_b == nullptr);
+
+    const int64_t n_embd   = cur->ne[0];
+    const int64_t n_tokens = cur->ne[1];
+
+    // routing, computed once
+    ggml_tensor * logits = build_lora_mm(gate_inp, cur);
+    cb(logits, "ffn_moe_logits", il);
+
+    ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+    cb(probs, "ffn_moe_probs", il);
+
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, probs, n_expert_used);
+    cb(selected_experts, "ffn_moe_topk", il);
+
+    probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+    ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts);
+    cb(weights, "ffn_moe_weights", il);
+
+    if (norm_w) {
+        weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
+        ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights);
+        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5f, INFINITY);
+        weights = ggml_div(ctx0, weights, weights_sum);
+        weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+        cb(weights, "ffn_moe_weights_norm", il);
+    }
+    if (w_scale != 0.0f && w_scale != 1.0f) {
+        weights = ggml_scale(ctx0, weights, w_scale);
+        cb(weights, "ffn_moe_weights_scaled", il);
+    }
+    ggml_build_forward_expand(gf, weights);
+
+    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    // per shard: gate/up over the feature slice, then the activation
+    std::vector<ggml_tensor *> act(n_shards, nullptr);
+    for (int d = 0; d < n_shards; ++d) {
+        ggml_tensor * up_d   = nullptr;
+        ggml_tensor * gate_d = nullptr;
+
+        if (gate_up_exps != nullptr && gate_up_exps[d] != nullptr) {
+            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps[d], cur, selected_experts, up_exps_s);
+            const int64_t n_ff = gate_up->ne[0]/2;
+            gate_d = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
+            up_d   = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
+        } else {
+            GGML_ASSERT(up_exps   != nullptr && up_exps[d]   != nullptr);
+            GGML_ASSERT(gate_exps != nullptr && gate_exps[d] != nullptr);
+            up_d   = build_lora_mm_id(up_exps[d],   cur, selected_experts, up_exps_s);
+            gate_d = build_lora_mm_id(gate_exps[d], cur, selected_experts, gate_exps_s);
+        }
+
+        act[d] = ggml_swiglu_split(ctx0, gate_d, up_d);
+        cb(act[d], "ffn_moe_swiglu", il);
+    }
+
+    // gather the activation slices so every device can contract the full n_ff
+    ggml_tensor * act_full = act[0];
+    for (int d = 1; d < n_shards; ++d) {
+        act_full = ggml_concat(ctx0, act_full, act[d], 0);
+    }
+    cb(act_full, "ffn_moe_act_full", il);
+
+    // per shard: down over the output slice (n_embd), then concatenate along n_embd
+    ggml_tensor * experts = nullptr;
+    for (int d = 0; d < n_shards; ++d) {
+        GGML_ASSERT(down_exps[d] != nullptr);
+        ggml_tensor * out_d = build_lora_mm_id(down_exps[d], act_full, selected_experts, down_exps_s);
+        experts = experts ? ggml_concat(ctx0, experts, out_d, 0) : out_d;
+    }
+
+    experts = ggml_mul(ctx0, experts, weights);
+    cb(experts, "ffn_moe_weighted", il);
+    ggml_build_forward_expand(gf, experts);
+
+    // aggregate over the selected experts
+    GGML_ASSERT(n_expert_used > 0);
+    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+        ggml_build_forward_expand(gf, cur_experts[i]);
+    }
+
+    ggml_tensor * moe_out = cur_experts[0];
+    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+        ggml_build_forward_expand(gf, moe_out);
+    }
+    if (n_expert_used_il == 1) {
+        moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    // pin the combined result to the device that owns the layer
+    cb(moe_out, "ffn_moe_out_sharded", il);
+
+    return moe_out;
+}
+
 // input embeddings with optional lora
 ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     const int64_t n_embd_inp = hparams.n_embd_inp();

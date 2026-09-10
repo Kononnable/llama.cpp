@@ -50,6 +50,20 @@ struct llama_model_loader {
         }
     };
 
+    // expert weight shards: one tensor per device selected by tensor_split_experts
+    struct shard_segment {
+        int64_t  extent; // number of elements in the parent along the split axis per repeat
+        uint32_t repeat;
+    };
+
+    struct shard_info {
+        const llama_tensor_weight * w;
+        int     axis;      // 0 or 1
+        int64_t low;       // this shard's low boundary within each segment
+        int64_t high;      // this shard's high boundary within each segment
+        std::vector<shard_segment> segments;
+    };
+
     // custom comparator to sort weights more nicely by layer
     struct weight_name_comparer {
         bool operator()(const std::string & a, const std::string & b) const {
@@ -164,6 +178,10 @@ struct llama_model_loader {
 
     std::map<ctx_key, ggml_context_ptr, ctx_key_comparator> ctx_map;
 
+    std::unordered_map<const ggml_tensor *, shard_info> shard_map;
+
+    void load_shard_data(const shard_info & s, ggml_tensor * dst);
+
     // track tensors that had to be moved for debugging:
     size_t n_tensors_moved = 0;
     std::string first_tensor_moved_name;
@@ -237,6 +255,15 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // create a single expert weight shard; the parent weight is looked up by name
+    struct ggml_tensor * create_tensor_shard(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_layer,
+        ggml_backend_buffer_type_t buft_forced,
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne,
+        int axis, int64_t low, int64_t high, const std::vector<shard_segment> & segments, int shard_idx);
+
+    ggml_context * ctx_for_buft(const llama_hparams & hparams, ggml_backend_buffer_type_t buft, bool is_lazy);
 
     void done_getting_tensors(bool partial = false) const;
 

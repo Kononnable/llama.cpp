@@ -1085,6 +1085,39 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
+ggml_context * llama_model_loader::ctx_for_buft(const llama_hparams & hparams, ggml_backend_buffer_type_t buft, bool is_lazy) {
+    const ctx_key key { buft, is_lazy };
+
+    auto it = ctx_map.find(key);
+    if (it != ctx_map.end()) {
+        return it->second.get();
+    }
+
+    // one ggml context per buffer type
+    int max_n_tensors = n_tensors;
+    max_n_tensors += 1;                   // duplicated output tensor
+    max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+    if (files.empty()) {
+        max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
+    }
+    const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) {
+        throw std::runtime_error(format("failed to create ggml context"));
+    }
+
+    ctx_map.emplace(key, ctx);
+
+    return ctx;
+}
+
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
     if (mode == LLAMA_LAZY_MODE_OFF) {
         return false;
@@ -1120,35 +1153,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     bool is_lazy = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
-
-        auto it = ctx_map.find(key);
-        if (it == ctx_map.end()) {
-            // one ggml context per buffer type
-            int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                   // duplicated output tensor
-            max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
-            if (files.empty()) {
-                max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
-            }
-            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
-
-            ggml_init_params params = {
-                /*.mem_size   =*/ ctx_size,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                throw std::runtime_error(format("failed to create ggml context"));
-            }
-
-            ctx_map.emplace(key, ctx);
-
-            return ctx;
-        }
-        return it->second.get();
+        return this->ctx_for_buft(hparams, buft, is_lazy);
     };
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
@@ -1389,6 +1394,134 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     return tensor;
 }
 
+struct ggml_tensor * llama_model_loader::create_tensor_shard(
+        const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_layer,
+        ggml_backend_buffer_type_t buft_forced,
+        const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne,
+        int axis, int64_t low, int64_t high, const std::vector<shard_segment> & segments, int shard_idx) {
+    const struct ggml_tensor * parent = require_tensor_meta(tn.str());
+
+    for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+        const int64_t want = i < ne.size() ? ne.begin()[i] : 1;
+        if (want != parent->ne[i]) {
+            throw std::runtime_error(format("%s: tensor '%s' has wrong shape; expected %s, got %s",
+                    __func__, tn.str().c_str(),
+                    llama_format_tensor_shape(ne).c_str(), llama_format_tensor_shape(parent).c_str()));
+        }
+    }
+
+    int64_t axis_extent = 0;
+    for (const auto & seg : segments) {
+        axis_extent += (high - low) * seg.repeat;
+    }
+
+    ggml_tensor t_meta = *parent;
+    t_meta.ne[axis] = axis_extent;
+    t_meta.nb[0] = ggml_type_size(t_meta.type);
+    t_meta.nb[1] = ggml_row_size(t_meta.type, t_meta.ne[0]);
+    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+        t_meta.nb[d] = t_meta.nb[d-1]*t_meta.ne[d-1];
+    }
+
+    const std::string shard_name = format("%s.shard%d", tn.str().c_str(), shard_idx);
+    ggml_set_name(&t_meta, shard_name.c_str());
+
+    ggml_backend_buffer_type_t buft = nullptr;
+    if (tensor_buft_overrides) {
+        for (const auto * o = tensor_buft_overrides; o->pattern != nullptr; ++o) {
+            std::regex pattern(o->pattern);
+            if (std::regex_search(tn.str(), pattern)) {
+                buft = o->buft == ggml_backend_cpu_buffer_type() ?
+                    select_weight_buft(hparams, &t_meta, GGML_OP_MUL_MAT_ID, buft_list_cpu) : o->buft;
+                break;
+            }
+        }
+    }
+    if (!buft && buft_forced != nullptr) {
+        buft = buft_forced;
+    }
+    if (!buft) {
+        buft = select_weight_buft(hparams, &t_meta, GGML_OP_MUL_MAT_ID, buft_list_layer);
+    }
+    if (!buft) {
+        throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", shard_name.c_str()));
+    }
+
+    LLAMA_LOG_DEBUG("%s: %s using buffer type %s\n", __func__, shard_name.c_str(), ggml_backend_buft_name(buft));
+
+    ggml_context * ctx = ctx_for_buft(hparams, buft, false);
+    ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+    ggml_set_name(tensor, shard_name.c_str());
+
+    shard_info info;
+    info.w        = get_weight(tn.str().c_str());
+    info.axis     = axis;
+    info.low      = low;
+    info.high     = high;
+    info.segments = segments;
+    GGML_ASSERT(info.w != nullptr);
+    shard_map.emplace(tensor, std::move(info));
+
+    // the parent weight is counted once, on its first shard
+    if (shard_idx == 0) {
+        n_created++;
+    }
+
+    return tensor;
+}
+
+void llama_model_loader::load_shard_data(const shard_info & s, ggml_tensor * dst) {
+    const ggml_tensor * parent = s.w->tensor;
+
+    const int64_t n_expert = parent->ne[2];
+    const int64_t n_embd   = parent->ne[1];
+
+    const size_t parent_nb1 = parent->nb[1];
+    const size_t parent_nb2 = parent->nb[2];
+    const size_t shard_nb1  = dst->nb[1];
+    const size_t shard_nb2  = dst->nb[2];
+
+    const int64_t shard_extent = s.high - s.low;
+
+    std::vector<no_init<uint8_t>> buf;
+    if (!use_mmap) {
+        const size_t max_sz = std::max((size_t) shard_extent*parent_nb1, parent_nb2);
+        buf.resize(max_sz);
+    }
+
+    for (int64_t e = 0; e < n_expert; ++e) {
+        if (s.axis == 1) {
+            size_t src_seg = e*parent_nb2;
+            size_t dst_seg = e*shard_nb2;
+            for (const auto & seg : s.segments) {
+                for (uint32_t r = 0; r < seg.repeat; ++r) {
+                    const size_t sz = (size_t) shard_extent*parent_nb1;
+                    const size_t src_off = src_seg + s.low*parent_nb1;
+                    const void * data = load_data_range(*s.w, src_off, sz, buf.data());
+                    ggml_backend_tensor_set(dst, data, dst_seg, sz);
+                    src_seg += (size_t) seg.extent*parent_nb1;
+                    dst_seg += (size_t) shard_extent*shard_nb1;
+                }
+            }
+        } else {
+            const size_t block_size = parent_nb2;
+            const size_t src_off = e*block_size;
+            const void * data = load_data_range(*s.w, src_off, block_size, buf.data());
+            // per output row, copy [low, high) values from the parent row
+            const size_t src_low  = ggml_row_size(parent->type, s.low);
+            const size_t src_size = ggml_row_size(parent->type, shard_extent);
+            ggml_backend_tensor_set_2d(dst, (const char *) data + src_low,
+                    e*shard_nb2, src_size, n_embd, shard_nb1, parent_nb1);
+        }
+    }
+
+    if (use_mmap) {
+        auto & mmap_used = mmaps_used[s.w->idx];
+        mmap_used.first  = std::min(mmap_used.first,  s.w->offs);
+        mmap_used.second = std::max(mmap_used.second, s.w->offs + ggml_nbytes(parent));
+    }
+}
+
 void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1623,6 +1756,13 @@ bool llama_model_loader::load_all_data(
     }
 
     for (struct ggml_tensor * cur : tensors) {
+        const auto shard_it = shard_map.find(cur);
+        if (shard_it != shard_map.end()) {
+            load_shard_data(shard_it->second, cur);
+            size_done += ggml_nbytes(cur);
+            continue;
+        }
+
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models

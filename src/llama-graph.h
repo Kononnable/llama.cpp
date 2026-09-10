@@ -1162,6 +1162,29 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // expert feature split: run the MoE FFN once per shard and sum the results
+    // the shard arrays must be valid for n_shards entries; up_exps/gate_exps/gate_up_exps may be null
+    ggml_tensor * build_moe_ffn_sharded(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * const * up_exps,
+             ggml_tensor * const * gate_exps,
+             ggml_tensor * const * down_exps,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             ggml_tensor * probs_in,
+             ggml_tensor * const * gate_up_exps,
+             ggml_tensor * up_exps_s,
+             ggml_tensor * gate_exps_s,
+             ggml_tensor * down_exps_s,
+                     int   n_shards) const;
+
     //
     // inputs
     //

@@ -346,6 +346,13 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps_s   = nullptr;
     struct ggml_tensor * ffn_up_exps_s     = nullptr;
 
+    // ff MoE feature-split shards (see tensor_split_experts); when ffn_exps_n_shards > 0 the
+    // shards[0 .. n-1] are used instead of the single pointers above
+    struct ggml_tensor * ffn_gate_exps_shards   [GGML_BACKEND_META_MAX_DEVICES] = {};
+    struct ggml_tensor * ffn_gate_up_exps_shards[GGML_BACKEND_META_MAX_DEVICES] = {};
+    struct ggml_tensor * ffn_up_exps_shards     [GGML_BACKEND_META_MAX_DEVICES] = {};
+    struct ggml_tensor * ffn_down_exps_shards   [GGML_BACKEND_META_MAX_DEVICES] = {};
+
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
@@ -749,6 +756,10 @@ struct llama_model {
     size_t n_tensors() const;
     size_t n_devices() const;
     const float * tensor_split() const;
+    const float * tensor_split_experts() const;
+
+    // number of devices holding expert feature slices; 0 when the expert split is disabled
+    size_t n_expert_devices() const;
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
@@ -825,6 +836,11 @@ struct llama_model_base : public llama_model {
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags);
+
+    // helper: create an expert weight, split across devices when tensor_split_experts is set
+    // when sharded, fills shards[0 .. n-1] and returns n (> 1); otherwise sets *single and returns 1 (0 if missing)
+    void create_tensor_exps(llama_layer & layer, int bid, llm_tensor tensor, const std::initializer_list<int64_t> & ne,
+                struct ggml_tensor ** shards, struct ggml_tensor ** single, int flags);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,

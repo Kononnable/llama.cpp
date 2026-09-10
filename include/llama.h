@@ -335,6 +335,9 @@ extern "C" {
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 
+        // proportion of the expert feature width to offload to each GPU, size: llama_max_devices(); NULL disables the expert split
+        const float * tensor_split_experts;
+
         // Called with a progress value between 0.0 and 1.0. Pass NULL to disable.
         // If the provided progress_callback returns true, model loading continues.
         // If it returns false, model loading is immediately aborted.

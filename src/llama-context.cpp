@@ -424,9 +424,24 @@ llama_context::llama_context(
 
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
+        // pipeline parallelism needs at least two devices that hold dense layers; with the expert
+        // split the extra device may hold only expert shards and then pipeline parallelism does not apply
+        bool dense_on_multiple_devices = false;
+        if (model.hparams.n_layer_all > 0) {
+            const ggml_backend_dev_t dev0 = model.dev_layer(0);
+            for (int il = 1; il < model.hparams.n_layer_all; ++il) {
+                if (model.dev_layer(il) != dev0) {
+                    dense_on_multiple_devices = true;
+                    break;
+                }
+            }
+            dense_on_multiple_devices = dense_on_multiple_devices || model.dev_output() != dev0;
+        }
+
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
+            dense_on_multiple_devices &&
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
@@ -2612,6 +2627,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
                         if (ggml_backend_supports_op(backend.get(), cur)) {
                             ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                         }
+                    }
+                }
+            }
+        }
+
+        // keep the expert-split combine on the device that owns the layer
+        if (il != -1 && strcmp(name, "ffn_moe_out_sharded") == 0) {
+            const auto & dev_layer = model.dev_layer(il);
+            for (const auto & backend : backends) {
+                if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                    if (ggml_backend_supports_op(backend.get(), cur)) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                     }
                 }
             }
