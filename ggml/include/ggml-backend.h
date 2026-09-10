@@ -404,6 +404,21 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // meta device introspection, used e.g. for per-device memory reporting:
+    GGML_API bool   ggml_backend_dev_is_meta           (ggml_backend_dev_t dev);
+    GGML_API bool   ggml_backend_buft_is_meta          (ggml_backend_buffer_type_t buft);
+    GGML_API bool   ggml_backend_buffer_is_meta        (ggml_backend_buffer_t buf);
+    GGML_API size_t ggml_backend_meta_dev_n_devs       (ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index);
+    GGML_API size_t ggml_backend_meta_buft_n_bufts     (ggml_backend_buffer_type_t meta_buft);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backend_buffer_type_t meta_buft, size_t index);
+    // returns the device corresponding to the meta buffer type slice with the given index
+    GGML_API ggml_backend_dev_t ggml_backend_meta_buft_get_device(ggml_backend_buffer_type_t meta_buft, size_t index);
+    GGML_API size_t ggml_backend_meta_buffer_n_bufs    (ggml_backend_buffer_t meta_buf);
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t meta_buf, size_t index);
+    // writes the sizes of the simple buffers of a meta buffer in bytes into sizes (must have room for ggml_backend_meta_buffer_n_bufs entries)
+    GGML_API void ggml_backend_meta_buffer_get_simple_sizes(ggml_backend_buffer_t meta_buf, size_t * sizes);
+
     //
     // Utils
     //
