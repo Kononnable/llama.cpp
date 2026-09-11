@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "ggml-backend.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1498,9 +1500,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
         res->set_params(params);
     }
 
-void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
+void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il, ggml_backend_buffer_type_t buft) const {
     if (cb_func) {
-        cb_func(ubatch, cur, name, il);
+        cb_func(ubatch, cur, name, il, buft);
     }
 }
 
@@ -2425,6 +2427,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
     }
     ggml_build_forward_expand(gf, weights);
 
+    GGML_ASSERT(n_expert_used > 0);
+    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     // per shard: gate/up over the feature slice, then the activation
@@ -2432,21 +2437,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
     for (int d = 0; d < n_shards; ++d) {
         ggml_tensor * up_d   = nullptr;
         ggml_tensor * gate_d = nullptr;
+        ggml_tensor * w_d    = nullptr;
 
         if (gate_up_exps != nullptr && gate_up_exps[d] != nullptr) {
-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps[d], cur, selected_experts, up_exps_s);
+            w_d = gate_up_exps[d];
+            ggml_tensor * gate_up = build_lora_mm_id(w_d, cur, selected_experts, up_exps_s);
             const int64_t n_ff = gate_up->ne[0]/2;
             gate_d = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
             up_d   = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff*gate_up->nb[0]);
         } else {
             GGML_ASSERT(up_exps   != nullptr && up_exps[d]   != nullptr);
             GGML_ASSERT(gate_exps != nullptr && gate_exps[d] != nullptr);
+            w_d    = up_exps[d];
             up_d   = build_lora_mm_id(up_exps[d],   cur, selected_experts, up_exps_s);
             gate_d = build_lora_mm_id(gate_exps[d], cur, selected_experts, gate_exps_s);
         }
 
         act[d] = ggml_swiglu_split(ctx0, gate_d, up_d);
-        cb(act[d], "ffn_moe_swiglu", il);
+        // keep the activation on the shard that owns the weights, otherwise the gather pulls it to another backend
+        cb(act[d], "ffn_moe_swiglu", il, w_d->buffer ? ggml_backend_buffer_get_type(w_d->buffer) : nullptr);
     }
 
     // gather the activation slices so every device can contract the full n_ff
@@ -2456,35 +2465,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
     }
     cb(act_full, "ffn_moe_act_full", il);
 
-    // per shard: down over the output slice (n_embd), then concatenate along n_embd
-    ggml_tensor * experts = nullptr;
+    // per shard: down over the output slice, weight and sum the experts, then concatenate along n_embd
+    ggml_tensor * moe_out = nullptr;
     for (int d = 0; d < n_shards; ++d) {
         GGML_ASSERT(down_exps[d] != nullptr);
         ggml_tensor * out_d = build_lora_mm_id(down_exps[d], act_full, selected_experts, down_exps_s);
-        experts = experts ? ggml_concat(ctx0, experts, out_d, 0) : out_d;
-    }
+        out_d = ggml_mul(ctx0, out_d, weights);
 
-    experts = ggml_mul(ctx0, experts, weights);
-    cb(experts, "ffn_moe_weighted", il);
-    ggml_build_forward_expand(gf, experts);
+        ggml_tensor * sum_d = nullptr;
+        for (uint32_t i = 0; i < n_expert_used_il; ++i) {
+            ggml_tensor * e = ggml_view_2d(ctx0, out_d, out_d->ne[0], n_tokens, out_d->nb[2], i*out_d->nb[1]);
+            sum_d = sum_d ? ggml_add(ctx0, sum_d, e) : e;
+            ggml_build_forward_expand(gf, sum_d);
+        }
+        if (n_expert_used_il == 1) {
+            sum_d = ggml_cont(ctx0, sum_d);
+        }
 
-    // aggregate over the selected experts
-    GGML_ASSERT(n_expert_used > 0);
-    const uint32_t n_expert_used_il = hparams.n_expert_used(il);
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-    for (uint32_t i = 0; i < n_expert_used_il; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
+        // keep the weighted sum on the shard, so only the reduced result crosses to the owner
+        cb(sum_d, "ffn_moe_out_shard", il, down_exps[d]->buffer ? ggml_backend_buffer_get_type(down_exps[d]->buffer) : nullptr);
 
-    ggml_tensor * moe_out = cur_experts[0];
-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-        ggml_build_forward_expand(gf, moe_out);
+        moe_out = moe_out ? ggml_concat(ctx0, moe_out, sum_d, 0) : sum_d;
     }
-    if (n_expert_used_il == 1) {
-        moe_out = ggml_cont(ctx0, moe_out);
-    }
+    ggml_build_forward_expand(gf, moe_out);
 
     // pin the combined result to the device that owns the layer
     cb(moe_out, "ffn_moe_out_sharded", il);

@@ -766,7 +766,7 @@ public:
 //   these are used by the llama_context to extact the relevant data, based on the compute parameters
 
 // callback that allows us to apply custom logic to each tensor (e.g. ggml-alloc, offloading, etc.)
-using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il)>;
+using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, ggml_backend_buffer_type_t buft)>;
 
 class llm_graph_result;
 
@@ -1044,7 +1044,7 @@ struct llm_graph_context {
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 
-    void cb(ggml_tensor * cur, const char * name, int il) const;
+    void cb(ggml_tensor * cur, const char * name, int il, ggml_backend_buffer_type_t buft = nullptr) const;
 
     //
     // common
