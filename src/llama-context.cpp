@@ -429,7 +429,7 @@ llama_context::llama_context(
         bool dense_on_multiple_devices = false;
         if (model.hparams.n_layer_all > 0) {
             const ggml_backend_dev_t dev0 = model.dev_layer(0);
-            for (int il = 1; il < model.hparams.n_layer_all; ++il) {
+            for (int il = 1; il < (int) model.hparams.n_layer_all; ++il) {
                 if (model.dev_layer(il) != dev0) {
                     dense_on_multiple_devices = true;
                     break;
