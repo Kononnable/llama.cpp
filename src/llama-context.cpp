@@ -2826,7 +2826,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 }
 
 llm_graph_cb llama_context::graph_get_cb() const {
-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il, ggml_backend_buffer_type_t buft) {
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
@@ -2858,6 +2858,18 @@ llm_graph_cb llama_context::graph_get_cb() const {
                     if (ggml_backend_supports_op(backend.get(), cur)) {
                         ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
                     }
+                }
+            }
+        }
+
+        // keep expert-split intermediates on the backend that holds their weights for small batches,
+        // otherwise the scheduler moves them to a higher-priority backend
+        if (buft != nullptr && ubatch.n_tokens < 32) {
+            for (const auto & backend : backends) {
+                if (ggml_backend_supports_buft(backend.get(), buft) &&
+                    ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
+                    break;
                 }
             }
         }
