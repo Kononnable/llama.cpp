@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -1659,9 +1660,54 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// env: GGML_SCHED_PERF - report per-backend split timing (forces a sync after each split)
+
+struct ggml_backend_sched_perf_data {
+    int64_t compute_us[GGML_SCHED_MAX_BACKENDS];
+    int64_t copy_us   [GGML_SCHED_MAX_BACKENDS];
+    int64_t n         [GGML_SCHED_MAX_BACKENDS];
+    const char * name [GGML_SCHED_MAX_BACKENDS];
+    int64_t t_last;
+};
+
+static ggml_backend_sched_perf_data g_sched_perf = {};
+
+static void ggml_backend_sched_perf(int backend_id, const char * name, int64_t compute_us, int64_t copy_us) {
+    auto & p = g_sched_perf;
+    p.compute_us[backend_id] += compute_us;
+    p.copy_us   [backend_id] += copy_us;
+    p.n         [backend_id] ++;
+    p.name      [backend_id]  = name;
+
+    const int64_t t_now = ggml_time_us();
+    if (p.t_last == 0) {
+        p.t_last = t_now;
+        return;
+    }
+    if (t_now - p.t_last < 1000000) {
+        return;
+    }
+
+    std::string line = "[sched-perf]";
+    for (int b = 0; b < GGML_SCHED_MAX_BACKENDS; b++) {
+        if (p.n[b] == 0) {
+            continue;
+        }
+        char buf[160];
+        snprintf(buf, sizeof(buf), " %s: compute=%.1fms copy=%.1fms n=%lld |",
+                p.name[b], 1e-3*p.compute_us[b], 1e-3*p.copy_us[b], (long long) p.n[b]);
+        line += buf;
+    }
+    GGML_LOG_INFO("%s\n", line.c_str());
+
+    p = {};
+    p.t_last = t_now;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    static const bool sched_perf = getenv("GGML_SCHED_PERF") != nullptr;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1673,6 +1719,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t t_split = sched_perf ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1811,6 +1858,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_copy = sched_perf ? ggml_time_us() : 0;
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1848,6 +1897,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        if (sched_perf) {
+            // force the async work to complete so the compute time is real, not just the enqueue
+            ggml_backend_synchronize(split_backend);
+            const int64_t t_end = ggml_time_us();
+            ggml_backend_sched_perf(split_backend_id, ggml_backend_name(split_backend), t_end - t_copy, t_copy - t_split);
         }
 
         // record the event of this split
