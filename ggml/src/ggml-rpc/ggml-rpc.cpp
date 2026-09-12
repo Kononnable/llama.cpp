@@ -48,7 +48,13 @@ static int rpc_perf_interval() {
 struct rpc_perf_data {
     int64_t compute_us = 0;
     int64_t loop_us    = 0;
+    int64_t set_us     = 0;
+    int64_t set_bytes  = 0;
+    int64_t get_us     = 0;
+    int64_t get_bytes  = 0;
     int64_t n          = 0;
+    int64_t set_n      = 0;
+    int64_t get_n      = 0;
 };
 
 static std::mutex    rpc_perf_mutex;
@@ -64,13 +70,19 @@ static void rpc_perf_report() {
         return;
     }
 
-    if (rpc_perf_server.n > 0) {
-        GGML_LOG_INFO("[rpc-perf] server: %lld graphs | compute=%8.2f ms | loop=%8.2f ms | overhead=%8.2f ms (%6.2f ms/req)\n",
+    if (rpc_perf_server.n > 0 || rpc_perf_server.set_n > 0 || rpc_perf_server.get_n > 0) {
+        GGML_LOG_INFO("[rpc-perf] server: %lld graphs | compute=%8.2f ms | loop=%8.2f ms | overhead=%8.2f ms (%6.2f ms/req) | set=%7.2f ms / %7.1f MB (%lld) | get=%7.2f ms / %7.1f MB (%lld)\n",
                 (long long) rpc_perf_server.n,
                 1e-3*rpc_perf_server.compute_us,
                 1e-3*rpc_perf_server.loop_us,
                 1e-3*(rpc_perf_server.loop_us - rpc_perf_server.compute_us),
-                1e-3*(rpc_perf_server.loop_us - rpc_perf_server.compute_us)/rpc_perf_server.n);
+                1e-3*(rpc_perf_server.loop_us - rpc_perf_server.compute_us)/(rpc_perf_server.n ? rpc_perf_server.n : 1),
+                1e-3*rpc_perf_server.set_us,
+                1e-6*rpc_perf_server.set_bytes,
+                (long long) rpc_perf_server.set_n,
+                1e-3*rpc_perf_server.get_us,
+                1e-6*rpc_perf_server.get_bytes,
+                (long long) rpc_perf_server.get_n);
     }
     if (rpc_perf_client.n > 0) {
         GGML_LOG_INFO("[rpc-perf] client: %lld req | wait=%8.2f ms | avg=%6.2f ms/req\n",
@@ -2688,6 +2700,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.set_tensor(input)) {
                     return;
                 }
+                if (rpc_perf_interval() >= 0) {
+                    std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+                    rpc_perf_server.set_us    += ggml_time_us() - t_cmd_start;
+                    rpc_perf_server.set_bytes += input.size();
+                    rpc_perf_server.set_n++;
+                }
                 break;
             }
             case RPC_CMD_SET_TENSOR_2D: {
@@ -2697,6 +2715,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 if (!server.set_tensor_2d(input)) {
                     return;
+                }
+                if (rpc_perf_interval() >= 0) {
+                    std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+                    rpc_perf_server.set_us    += ggml_time_us() - t_cmd_start;
+                    rpc_perf_server.set_bytes += input.size();
+                    rpc_perf_server.set_n++;
                 }
                 break;
             }
@@ -2711,6 +2735,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
+                }
+                if (rpc_perf_interval() >= 0) {
+                    std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+                    rpc_perf_server.get_us    += ggml_time_us() - t_cmd_start;
+                    rpc_perf_server.get_bytes += response.size();
+                    rpc_perf_server.get_n++;
                 }
                 break;
             }
@@ -2749,6 +2779,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
+                }
+                if (rpc_perf_interval() >= 0) {
+                    std::lock_guard<std::mutex> lock(rpc_perf_mutex);
+                    rpc_perf_server.get_us    += ggml_time_us() - t_cmd_start;
+                    rpc_perf_server.get_bytes += response.size();
+                    rpc_perf_server.get_n++;
                 }
                 break;
             }
