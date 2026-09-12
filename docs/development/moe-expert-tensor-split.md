@@ -46,9 +46,9 @@ Constraints:
 
 ## Decisions
 
-1. Split semantics: option A, feature split (the existing Meta axes). Not
-   expert-parallel. Feature split is ratio-exact and never idles a device; expert
-   parallel is routing-dependent and can put 0 of k experts on a device.
+1. Split semantics: option A, feature split. Not expert-parallel. Feature split is
+   ratio-exact (up to the quant block on the contraction axis) and never idles a device;
+   expert-parallel is routing-dependent and can put 0 of k experts on a device.
 2. Reduce: explicit shard tensors plus a graph-level `ggml_add`, reduce-to-owner. The
    result is not sent to backends that do not consume it. Do not use the Meta
    butterfly reduce.
@@ -79,7 +79,7 @@ Per expert weight tensor:
 |---|---|---|
 | `ffn_gate_exps` / `ffn_up_exps` | `[n_embd, n_ff, n_expert]` | 1 |
 | `ffn_gate_up_exps` | `[n_embd, 2*n_ff, n_expert]` | 1, segments `{n_ff, 2}` |
-| `ffn_down_exps` | `[n_ff, n_embd, n_expert]` | 1 (output `n_embd`) |
+| `ffn_down_exps` | `[n_ff, n_embd, n_expert]` | 0 (contraction `n_ff`) |
 
 Siblings:
 
@@ -89,8 +89,11 @@ Siblings:
 - `ffn_down_exps_b` (`{n_embd, n_expert}`): applied post-combine on the owner.
 - `_exps_in_s`: unused by the MoE graph; ignore.
 
-Shard boundaries must be multiples of `lcm(blck_size, 128)` for the FFN expert case.
-Rows stay whole, so the quant block structure is preserved.
+Shard boundaries on the quantized axis must be multiples of `lcm(blck_size, 64)`. The gate/up
+split over `n_ff` uses the down's granularity, so a shard's activation slice covers exactly
+the weight slice its down multiplies. The ratio is therefore limited to whole blocks of the
+down's contraction axis: a narrow `n_ff_exp` (few blocks) collapses neighbouring ratios onto
+the same boundary.
 
 ## Configuration
 
@@ -186,20 +189,17 @@ for each shard d:
     up_d   = mul_mat_id(up_exps_shards[d],   cur, selected_experts) * up_exps_s_shards[d]
     gate_d = mul_mat_id(gate_exps_shards[d], cur, selected_experts) * gate_exps_s_shards[d]
     act_d  = swiglu(gate_d, up_d)                 // [n_ff_d, n_expert_used, n_tokens]
-act = concat_d act_d                              // gather, [n_ff, ...]
 for each shard d:
-    out_d  = mul_mat_id(down_exps_shards[d], act, selected_experts)  // [n_embd_d, ...]
-experts = concat_d out_d                          // [n_embd, n_expert_used, n_tokens]
-experts = experts * weights
-moe_out = sum over n_expert_used views
+    out_d  = mul_mat_id(down_exps_shards[d], act_d, selected_experts)  // [n_embd, ...]
+experts = sum_d out_d
+moe_out = experts * weights, summed over n_expert_used views
 ```
 
-Why the down split moved to `n_embd`: splitting `ffn_down_exps` on `n_ff` splits the
-quantized dimension, so the granularity is one quant block. For `n_ff_exp = 512` and
-`QK_K = 256` that is only two blocks, which collapses every ratio to 1:1. Splitting on
-`n_embd` (and on `n_ff` for gate/up) touches no quant block, so the ratio is arbitrary.
-The price is that every device needs the full activation, hence the `concat` gather, and
-the output is sharded along `n_embd` and concatenated on the way out.
+Splitting `ffn_down_exps` on `n_embd` leaves the quantized dimension intact, so the ratio is
+arbitrary, but every device then needs the full activation: the activation must be gathered
+and the output sharded back. Splitting on `n_ff` instead makes each shard contract only its
+own activation slice, so no activation gather is needed and the output is a plain sum. The
+price is that the boundaries are quantized to the down's block, which limits the ratio.
 
 Factorization to avoid duplicating the shared function:
 
@@ -226,10 +226,10 @@ for (auto & backend : backends) {
 ## RPC and latency
 
 Per MoE layer: mirror the activation to the other expert devices, run the per-shard
-matmuls, one remote-to-owner partial transfer, local `ggml_add`. Two serialized network
-waits per layer, mandatory because the activation is needed by every shard and the
-reduce must come back to the owner. No butterfly. Weights are only transferred at model
-load.
+gate/up matmuls, write the per-shard activation slices back to the shards, run the per-shard
+downs, and reduce the partial results on the owner. The down needs only the producing
+shard's own slice, so the full activation is not gathered. Weights are only transferred at
+model load.
 
 ## Scope and call sites
 
@@ -283,10 +283,10 @@ Done (PoC, qwen35moe and qwen4exp):
 - `llama_layer` shard arrays and `llama_model_loader::create_tensor_shard` / `load_shard_data`.
 - `create_tensor_exps` and wiring in `create_tensor_gate_up_exps`; qwen35moe and qwen4exp call it
   for `ffn_down_exps` and gate/up.
-- `build_moe_ffn_sharded`: computes the routing once, runs gate/up per shard, gathers the
-  activation with `ggml_concat`, runs down per shard on `n_embd`, concatenates the output
-  slices, and the `ffn_moe_out_sharded` callback pins the result to the layer device. Only
-  supports `SOFTMAX` gating, `LLM_FFN_SILU`, and no biases for now.
+- `build_moe_ffn_sharded`: computes the routing once, runs gate/up per shard, runs the down on each
+  shard's own activation slice, sums the per-shard partial results, and the `ffn_moe_out_sharded`
+  callback pins the result to the layer device. Only supports `SOFTMAX` gating, `LLM_FFN_SILU`,
+  and no biases for now.
 - Validation: `-tse` requires `LLAMA_SPLIT_MODE_LAYER`, the allow-listed archs, at least two
   nonzero shares, and no expert scales.
 - Host RAM placement: an expert shard goes to the device host buffer (`ROCm_Host`) when its
@@ -297,17 +297,17 @@ Done (PoC, qwen35moe and qwen4exp):
   reproduce the parent tensor).
 
 Verified on `Qwen3.6-35B-A3B-UD-IQ1_M.gguf` with `ROCm0` plus a local `ggml-rpc-server` as
-`RPC0`: `-ts 1,0 -tse 1,3` and `-ts 1,1 -tse 1,3` produce byte-identical output to the
-non-split baseline for both decode and a 1700-token prefill.
+`RPC0`: loads and runs for both decode and prefill. Output is not bit-exact versus the
+non-split baseline, because the down is contracted in per-shard partial sums and the
+summation order changes.
 
 Known limitations of the PoC:
 
-- The split is on the non-quantized axes, so the ratio is arbitrary. Verified with
-  `-tse 1,10`: `n_ff` splits 46/466 and `n_embd` splits 186/1862, and the output is
-  byte-identical to the non-split baseline.
+- The split is on the quantized contraction axis for the down, so the ratio is limited to whole
+  blocks of `n_ff`; the gate/up split matches the down's granularity.
 - Routing is computed once per layer in the sharded path.
 - The merged `ffn_gate_up_exps` shard load path is implemented but untested on this machine.
-- The activation gather and the output concatenation add serialized work per layer; their
-  placement relies on the scheduler inserting the cross-device copies.
+- The per-shard output sum adds serialized work per layer; its placement relies on the scheduler
+  inserting the cross-device copies.
 - The host offload path (RAM to VRAM at batch >= 32) uses the existing scheduler path and is
   not exercised on a real second machine here.
