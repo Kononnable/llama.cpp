@@ -2454,22 +2454,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
         }
 
         act[d] = ggml_swiglu_split(ctx0, gate_d, up_d);
-        // keep the activation on the shard that owns the weights, otherwise the gather pulls it to another backend
+        // keep the activation on the shard that owns the weights, it is consumed there by the down
         cb(act[d], "ffn_moe_swiglu", il, w_d->buffer ? ggml_backend_buffer_get_type(w_d->buffer) : nullptr);
     }
 
-    // gather the activation slices so every device can contract the full n_ff
-    ggml_tensor * act_full = act[0];
-    for (int d = 1; d < n_shards; ++d) {
-        act_full = ggml_concat(ctx0, act_full, act[d], 0);
-    }
-    cb(act_full, "ffn_moe_act_full", il);
-
-    // per shard: down over the output slice, weight and sum the experts, then concatenate along n_embd
+    // each shard contracts only its own activation slice; the down keeps the full n_embd output,
+    // so the per-shard partial results are summed instead of concatenated
     ggml_tensor * moe_out = nullptr;
     for (int d = 0; d < n_shards; ++d) {
         GGML_ASSERT(down_exps[d] != nullptr);
-        ggml_tensor * out_d = build_lora_mm_id(down_exps[d], act_full, selected_experts, down_exps_s);
+        ggml_tensor * out_d = build_lora_mm_id(down_exps[d], act[d], selected_experts, down_exps_s);
         out_d = ggml_mul(ctx0, out_d, weights);
 
         ggml_tensor * sum_d = nullptr;
@@ -2485,7 +2479,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
         // keep the weighted sum on the shard, so only the reduced result crosses to the owner
         cb(sum_d, "ffn_moe_out_shard", il, down_exps[d]->buffer ? ggml_backend_buffer_get_type(down_exps[d]->buffer) : nullptr);
 
-        moe_out = moe_out ? ggml_concat(ctx0, moe_out, sum_d, 0) : sum_d;
+        moe_out = moe_out ? ggml_add(ctx0, moe_out, sum_d) : sum_d;
     }
     ggml_build_forward_expand(gf, moe_out);
 

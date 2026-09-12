@@ -3399,10 +3399,9 @@ void llama_model_base::create_tensor_exps(llama_layer & layer, int bid, llm_tens
             segments.push_back({ ne_v[1]/2, 2 });
             break;
         case LLM_TENSOR_FFN_DOWN_EXPS:
-            // split the output axis (n_embd); splitting the quantized contraction axis (n_ff) would
-            // limit the granularity to whole blocks
-            axis = 1;
-            segments.push_back({ ne_v[1], 1 });
+            // split the contraction axis (n_ff), so each shard only needs its own activation slice
+            axis = 0;
+            segments.push_back({ ne_v[0], 1 });
             break;
         default:
             GGML_ABORT("create_tensor_exps: unsupported tensor %d", (int) tensor);
@@ -3424,8 +3423,18 @@ void llama_model_base::create_tensor_exps(llama_layer & layer, int bid, llm_tens
     }
 
     const int64_t extent      = ne_v[axis];
-    // the split is on a non-quantized axis, so any granularity is valid; keep the block alignment only for safety
-    const int64_t granularity = axis == 0 ? std::lcm((int64_t) ggml_blck_size(parent->type), (int64_t) 128) : 1;
+    // axis 0 is the quantized contraction axis, so boundaries must fall on whole blocks. the gate/up
+    // split over the same n_ff uses the down's granularity, otherwise a shard's activation slice
+    // does not cover the weight slice its down multiplies
+    int64_t granularity = 1;
+    if (axis == 0) {
+        granularity = std::lcm((int64_t) ggml_blck_size(parent->type), (int64_t) 64);
+    } else {
+        const ggml_tensor * down_meta = ml->get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", bid).str().c_str());
+        if (down_meta != nullptr) {
+            granularity = std::lcm((int64_t) ggml_blck_size(down_meta->type), (int64_t) 64);
+        }
+    }
 
     std::vector<int64_t> bounds(n_shards + 1, 0);
     {
