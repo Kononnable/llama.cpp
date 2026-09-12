@@ -1230,6 +1230,15 @@ struct llama_model::impl {
 
     // expert shards that live in pinned host RAM instead of the device memory
     std::vector<bool> expert_host_ram;
+
+    // the expert split boundary is quantized to whole blocks, so carry the rounding error across
+    // the layers: quantize the cumulative boundary instead of the per-layer one
+    std::vector<int64_t> expert_carry;      // aligned cumulative boundary through the previous layer
+    std::vector<int64_t> expert_bounds;     // bounds computed for the layer being built
+    int64_t              expert_carry_layer  = -1;
+    int64_t              expert_carry_count  = 0;
+    int64_t              expert_carry_extent = -1;
+    int64_t              expert_carry_gran   = -1;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -3438,28 +3447,57 @@ void llama_model_base::create_tensor_exps(llama_layer & layer, int bid, llm_tens
 
     std::vector<int64_t> bounds(n_shards + 1, 0);
     {
-        float sum = 0.0f;
-        std::vector<float> scan(n_shards);
+        double sum = 0.0;
+        std::vector<double> scan(n_shards);
         for (size_t j = 0; j < n_shards; ++j) {
             sum += pimpl->expert_splits[j];
             scan[j] = sum;
         }
-        int64_t low = 0;
-        for (size_t j = 0; j + 1 < n_shards; ++j) {
-            int64_t high = sum == 0.0f ? extent*(int64_t)(j + 1)/n_shards : (int64_t)(extent*scan[j]/scan.back());
-            high -= high % granularity;
-            // every shard needs at least one block, and every remaining shard too
-            const int64_t min_high = low + granularity;
-            int64_t max_high = extent - granularity*(int64_t)(n_shards - 1 - j);
-            max_high -= max_high % granularity;
-            if (min_high > max_high) {
-                throw std::runtime_error(format("tensor '%s': expert split too fine for %zu devices", tn_impl.str().c_str(), n_shards));
-            }
-            high = std::max(min_high, std::min(high, max_high));
-            bounds[j + 1] = high;
-            low = high;
+
+        // quantizing every layer's boundary on its own always rounds down, so the shard ends up
+        // under the requested share on each layer. instead quantize the cumulative boundary and
+        // take the difference from the previous layer as this layer's boundary
+        auto & carry = pimpl->expert_carry;
+
+        if (carry.size() != n_shards - 1 ||
+                pimpl->expert_carry_extent != extent ||
+                pimpl->expert_carry_gran != granularity) {
+            carry.assign(n_shards - 1, 0);
+            pimpl->expert_carry_count  = 0;
+            pimpl->expert_carry_layer  = -1;
+            pimpl->expert_carry_extent = extent;
+            pimpl->expert_carry_gran   = granularity;
         }
-        bounds[n_shards] = extent;
+
+        // the gate/up and the down of a layer must get the same boundary, so advance once per layer
+        if (pimpl->expert_carry_layer == (int64_t) bid) {
+            bounds = pimpl->expert_bounds;
+        } else {
+            pimpl->expert_carry_count++;
+            pimpl->expert_carry_layer = (int64_t) bid;
+
+            const int64_t n = pimpl->expert_carry_count;
+            int64_t low = 0;
+            for (size_t j = 0; j + 1 < n_shards; ++j) {
+                const double ideal = sum == 0.0 ? (double) n*extent*(int64_t)(j + 1)/n_shards : (double) n*extent*scan[j]/scan.back();
+                const int64_t cum  = (int64_t) ideal/granularity*granularity;
+
+                int64_t high = cum - carry[j];
+                // every shard needs at least one block, and every remaining shard too
+                const int64_t min_high = low + granularity;
+                int64_t max_high = extent - granularity*(int64_t)(n_shards - 1 - j);
+                max_high -= max_high % granularity;
+                if (min_high > max_high) {
+                    throw std::runtime_error(format("tensor '%s': expert split too fine for %zu devices", tn_impl.str().c_str(), n_shards));
+                }
+                high = std::max(min_high, std::min(high, max_high));
+                bounds[j + 1] = high;
+                carry[j] = carry[j] + high;
+                low = high;
+            }
+            bounds[n_shards] = extent;
+            pimpl->expert_bounds = bounds;
+        }
     }
 
     for (size_t j = 0; j < n_shards; ++j) {
