@@ -116,9 +116,8 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader & ml) {
         } else {
             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", il), { n_embd, n_expert }, trunk_flags);
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", il), { n_expert }, trunk_flags);
-            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, trunk_flags);
-            layer.ffn_up_exps = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, trunk_flags);
-            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { hparams.n_ff_exp(), n_embd, n_expert }, trunk_flags);
+            create_tensor_exps(layer, il, LLM_TENSOR_FFN_DOWN_EXPS, { hparams.n_ff_exp(), n_embd, n_expert }, layer.ffn_down_exps_shards, &layer.ffn_down_exps, trunk_flags);
+            create_tensor_gate_up_exps(layer, il, n_embd, hparams.n_ff_exp(), n_expert, trunk_flags);
             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), { n_embd, hparams.n_ff_shexp }, trunk_flags);
             layer.ffn_up_shexp = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", il), { n_embd, hparams.n_ff_shexp }, trunk_flags);
             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", il), { hparams.n_ff_shexp, n_embd }, trunk_flags);
@@ -146,9 +145,8 @@ void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", il), { n_embd }, flags);
         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", il), { n_embd, n_expert }, flags);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", il), { n_expert }, flags);
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, flags);
-        layer.ffn_up_exps = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il), { n_embd, hparams.n_ff_exp(), n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { hparams.n_ff_exp(), n_embd, n_expert }, flags);
+        create_tensor_exps(layer, il, LLM_TENSOR_FFN_DOWN_EXPS, { hparams.n_ff_exp(), n_embd, n_expert }, layer.ffn_down_exps_shards, &layer.ffn_down_exps, flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, hparams.n_ff_exp(), n_expert, flags);
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", il), { n_embd, hparams.n_ff_shexp }, flags);
         layer.ffn_up_shexp = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", il), { n_embd, hparams.n_ff_shexp }, flags);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", il), { hparams.n_ff_shexp, n_embd }, flags);
@@ -378,7 +376,22 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
                     layer.ffn_down, nullptr, nullptr,
                     nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
         } else {
-            ggml_tensor * moe = build_moe_ffn(cur,
+            ggml_tensor * moe = model.n_expert_devices() > 0
+                ? build_moe_ffn_sharded(cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps_shards,
+                    layer.ffn_gate_exps_shards,
+                    layer.ffn_down_exps_shards,
+                    layer.ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU,
+                    hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il, nullptr, layer.ffn_gate_up_exps_shards,
+                    nullptr, nullptr, nullptr,
+                    (int) model.n_expert_devices())
+                : build_moe_ffn(cur,
                     layer.ffn_gate_inp,
                     layer.ffn_up_exps,
                     layer.ffn_gate_exps,
@@ -389,7 +402,7 @@ llama_model_bailingmoe3::graph::graph(const llama_model & model, const llm_graph
                     hparams.expert_weights_norm,
                     hparams.expert_weights_scale,
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il, nullptr, layer.ffn_gate_up_exps);
             ggml_tensor * shared = build_ffn(cur,
                     layer.ffn_up_shexp, nullptr, nullptr,
                     layer.ffn_gate_shexp, nullptr, nullptr,
@@ -531,7 +544,22 @@ llama_model_bailingmoe3::graph_mtp::graph_mtp(const llama_model & model, const l
     ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
     cur = build_norm(ffn_inp, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
 
-    ggml_tensor * moe = build_moe_ffn(cur,
+    ggml_tensor * moe = model.n_expert_devices() > 0
+        ? build_moe_ffn_sharded(cur,
+            layer.ffn_gate_inp,
+            layer.ffn_up_exps_shards,
+            layer.ffn_gate_exps_shards,
+            layer.ffn_down_exps_shards,
+            layer.ffn_exp_probs_b,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU,
+            hparams.expert_weights_norm,
+            hparams.expert_weights_scale,
+            (llama_expert_gating_func_type) hparams.expert_gating_func,
+            il, nullptr, layer.ffn_gate_up_exps_shards,
+            nullptr, nullptr, nullptr,
+            (int) model.n_expert_devices())
+        : build_moe_ffn(cur,
             layer.ffn_gate_inp,
             layer.ffn_up_exps,
             layer.ffn_gate_exps,
@@ -542,7 +570,7 @@ llama_model_bailingmoe3::graph_mtp::graph_mtp(const llama_model & model, const l
             hparams.expert_weights_norm,
             hparams.expert_weights_scale,
             (llama_expert_gating_func_type) hparams.expert_gating_func,
-            il);
+            il, nullptr, layer.ffn_gate_up_exps);
     ggml_tensor * shared = build_ffn(cur,
             layer.ffn_up_shexp, nullptr, nullptr,
             layer.ffn_gate_shexp, nullptr, nullptr,

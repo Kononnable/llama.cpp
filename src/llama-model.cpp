@@ -358,7 +358,7 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
         }
-        if (params.tensor_split_experts != nullptr && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP) {
+        if (params.tensor_split_experts != nullptr && arch != LLM_ARCH_QWEN35MOE && arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_BAILINGMOE3) {
             throw std::runtime_error(std::string("tensor_split_experts not implemented for architecture '") + llm_arch_name(arch) + "'");
         }
     }

@@ -68,7 +68,7 @@ Constraints:
    with `-cmoe` today. The per-layer network round trip is accepted because it is
    small compared to the expert activation time.
 10. `--fit` is a non-goal.
-11. First targets: `qwen35moe` and `qwen4exp` only.
+11. First targets: `qwen35moe`, `qwen4exp` and `bailingmoe3` only.
 12. Prefill RAM to VRAM copy reuses the existing `op_offload` path; no copy is forced.
 
 ## Split semantics
@@ -233,13 +233,15 @@ model load.
 
 ## Scope and call sites
 
-Arch allow-list: `LLM_ARCH_QWEN35MOE`, `LLM_ARCH_QWEN4EXP`. Both share
-`create_tensor_gate_up_exps` and the same MoE FFN shape (`LLM_FFN_SILU`, `norm_w=true`,
-`SOFTMAX`, no expert biases).
+Arch allow-list: `LLM_ARCH_QWEN35MOE`, `LLM_ARCH_QWEN4EXP`, `LLM_ARCH_BAILINGMOE3`. All share
+`create_tensor_gate_up_exps`. `qwen35moe` and `qwen4exp` use `LLM_FFN_SILU`, `norm_w=true`,
+`SOFTMAX`, no expert biases. `bailingmoe3` uses `SIGMOID` gating with a per-expert selection
+bias, expert groups and a swiglu clamp on the expert FFN.
 
-- Load: `qwen35moe.cpp:96`, `:123`; `qwen4exp.cpp:250` and the
+- Load: `qwen35moe.cpp:96`, `:123`; `qwen4exp.cpp:250`; `bailingmoe3.cpp` and the
   `create_tensor_gate_up_exps` path.
-- Graph: `qwen35moe.cpp:499`, `:679`; `qwen4exp.cpp:978`.
+- Graph: `qwen35moe.cpp:499`, `:679`; `qwen4exp.cpp:978`; the `bailingmoe3.cpp` trunk and
+  MTP graphs.
 
 Boundary logic: factor only the expert FFN cases out of
 `llama_meta_device_get_split_state` (gate/up `{{ne[axis], 1}}`, merged `gate_up`
@@ -285,8 +287,8 @@ Done (PoC, qwen35moe and qwen4exp):
   for `ffn_down_exps` and gate/up.
 - `build_moe_ffn_sharded`: computes the routing once, runs gate/up per shard, runs the down on each
   shard's own activation slice, sums the per-shard partial results, and the `ffn_moe_out_sharded`
-  callback pins the result to the layer device. Only supports `SOFTMAX` gating, `LLM_FFN_SILU`,
-  and no biases for now.
+  callback pins the result to the layer device. Supports `SOFTMAX` and `SIGMOID` gating, an expert
+  selection bias, expert groups and the swiglu clamp, all with `LLM_FFN_SILU`.
 - Validation: `-tse` requires `LLAMA_SPLIT_MODE_LAYER`, the allow-listed archs, at least two
   nonzero shares, and no expert scales.
 - Host RAM placement: an expert shard goes to the device host buffer (`ROCm_Host`) when its

@@ -2391,10 +2391,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
                  int   n_shards) const {
     GGML_ASSERT(n_shards > 0);
     GGML_ASSERT(down_exps != nullptr);
-    GGML_ASSERT(gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX);
     GGML_ASSERT(type_op == LLM_FFN_SILU);
     GGML_ASSERT(probs_in == nullptr);
-    GGML_ASSERT(exp_probs_b == nullptr);
 
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
@@ -2403,10 +2401,47 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
     ggml_tensor * logits = build_lora_mm(gate_inp, cur);
     cb(logits, "ffn_moe_logits", il);
 
-    ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+    ggml_tensor * probs = nullptr;
+    switch (gating_op) {
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+            probs = ggml_soft_max(ctx0, logits);
+            break;
+        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+            probs = ggml_sigmoid(ctx0, logits);
+            break;
+        default:
+            GGML_ABORT("fatal error: unsupported gating function with tensor_split_experts");
+    }
     cb(probs, "ffn_moe_probs", il);
 
-    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, probs, n_expert_used);
+    // the expert selection bias only shifts the ranking, the weights stay unbiased
+    ggml_tensor * selection_probs = probs;
+    if (exp_probs_b != nullptr) {
+        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+        cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
+    // select top n_group_used expert groups
+    if (hparams.n_expert_groups > 1 && n_tokens > 0) {
+        const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
+
+        ggml_tensor * selection_groups = ggml_reshape_3d(ctx0, selection_probs, n_exp_per_group, hparams.n_expert_groups, n_tokens);
+
+        ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2);
+        group_scores = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]), group_scores);
+        group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3]));
+        group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]);
+
+        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used);
+        cb(expert_groups, "ffn_moe_group_topk", il);
+
+        selection_probs = ggml_get_rows(ctx0, selection_groups, expert_groups);
+        selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups);
+        selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens);
+        cb(selection_probs, "ffn_moe_probs_masked", il);
+    }
+
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);
     cb(selected_experts, "ffn_moe_topk", il);
 
     probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
@@ -2453,9 +2488,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn_sharded(
             gate_d = build_lora_mm_id(gate_exps[d], cur, selected_experts, gate_exps_s);
         }
 
-        act[d] = ggml_swiglu_split(ctx0, gate_d, up_d);
-        // keep the activation on the shard that owns the weights, it is consumed there by the down
-        cb(act[d], "ffn_moe_swiglu", il, w_d->buffer ? ggml_backend_buffer_get_type(w_d->buffer) : nullptr);
+        const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        if (limit > 1e-6f) {
+            up_d = ggml_clamp(ctx0, up_d, -limit, limit);
+            cb(up_d, "ffn_moe_up_clamped", il);
+            ggml_tensor * gate_act = ggml_silu(ctx0, gate_d);
+            cb(gate_act, "ffn_moe_silu", il);
+            gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+            cb(gate_act, "ffn_moe_silu_clamped", il);
+            act[d] = ggml_mul(ctx0, gate_act, up_d);
+            // keep the activation on the shard that owns the weights, it is consumed there by the down
+            cb(act[d], "ffn_moe_swiglu_limited", il, w_d->buffer ? ggml_backend_buffer_get_type(w_d->buffer) : nullptr);
+        } else {
+            act[d] = ggml_swiglu_split(ctx0, gate_d, up_d);
+            // keep the activation on the shard that owns the weights, it is consumed there by the down
+            cb(act[d], "ffn_moe_swiglu", il, w_d->buffer ? ggml_backend_buffer_get_type(w_d->buffer) : nullptr);
+        }
     }
 
     // each shard contracts only its own activation slice; the down keeps the full n_embd output,
